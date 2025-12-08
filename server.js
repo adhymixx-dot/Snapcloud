@@ -1,90 +1,66 @@
 import express from "express";
 import multer from "multer";
 import cors from "cors";
-import fs from "fs";
-import path from "path";
-import { uploadToTelegram, downloadFromTelegram } from "./uploader.js";
+import { uploadToTelegram } from "./uploader.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Multer en disco temporal
+// Multer para archivos grandes
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, "temp/"),
-    filename: (req, file, cb) => cb(null, Date.now() + "-" + file.originalname)
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
 });
 
-// Asegurarse de que exista carpeta temporal
-if (!fs.existsSync("temp")) fs.mkdirSync("temp");
-
-// URL de Apps Script
-const SHEETS_URL = "https://script.google.com/macros/s/AKfycbyVVUlspr7pbtujmpjHUKH_8Ru18o2h_8jl2iuK0z_AOaC6BIC1SkGCLUbrAMEgPMH3/exec"; // reemplaza con la tuya
-
-// Ruta raíz
+// Endpoint raíz
 app.get("/", (req, res) => res.send("SnapCloud Backend funcionando!"));
 
-// Subir archivo
+// Subida de archivo
 app.post("/upload", upload.single("file"), async (req, res) => {
-  const userId = req.body.userId || "anon";
-
-  if (!req.file) return res.status(400).json({ error: "No file provided" });
-
   try {
-    // Subir a Telegram
-    const result = await uploadToTelegram(req.file);
+    if (!req.file) return res.status(400).json({ error: "No file provided" });
 
-    // Guardar en Google Sheets
-    await fetch(SHEETS_URL, {
+    const telegramResult = await uploadToTelegram(req.file);
+    const telegramFileId = telegramResult.id || telegramResult;
+
+    // Guardar metadata en Google Sheets vía Apps Script
+    const response = await fetch("https://script.google.com/macros/s/AKfycbxZED-LfBaRR1q3mpwX2WzALowmzVANnBDqq1wDfhJNoB0fTMo8j_B1ftPlf6eBbwdZ/exec", {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        userId,
+        username: req.body.userId,
         fileName: req.file.originalname,
-        telegramFileId: result.id || result
-      }),
-      headers: { "Content-Type": "application/json" }
+        telegramFileId
+      })
+    });
+    await response.json();
+
+    res.json({
+      ok: true,
+      fileId: telegramFileId,
+      message: "Archivo subido y guardado correctamente"
     });
 
-    // Borrar archivo temporal
-    fs.unlinkSync(req.file.path);
-
-    res.json({ ok: true, fileId: result.id || result, message: "Archivo subido correctamente" });
   } catch (err) {
     console.error("Error en /upload:", err);
-    res.status(500).json({ error: err.message || "Error subiendo archivo" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Endpoint para listar archivos de un usuario
+// Listar archivos de un usuario
 app.get("/files", async (req, res) => {
-  const userId = req.query.userId || "anon";
   try {
-    const response = await fetch(`${SHEETS_URL}?userId=${userId}`);
+    const userId = req.query.userId;
+    const response = await fetch(`TU_APPS_SCRIPT_URL?username=${userId}`);
     const files = await response.json();
     res.json(files);
   } catch (err) {
     console.error("Error en /files:", err);
-    res.status(500).json({ error: "Error obteniendo archivos" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Descargar archivo desde Telegram
-app.get("/download", async (req, res) => {
-  const { fileId, fileName } = req.query;
-  if (!fileId) return res.status(400).send("Falta fileId");
-
-  try {
-    const buffer = await downloadFromTelegram(fileId); // implementar en uploader.js
-    res.setHeader("Content-Disposition", `attachment; filename="${fileName || "file"}"`);
-    res.send(buffer);
-  } catch (err) {
-    console.error("Error en /download:", err);
-    res.status(500).send("Error descargando archivo");
-  }
-});
-
+// Puerto asignado por Render
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor iniciado en puerto ${PORT}`));
+app.listen(PORT, () => console.log("Servidor iniciado en puerto " + PORT));
