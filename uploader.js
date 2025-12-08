@@ -1,39 +1,35 @@
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 
-// Configuración desde variables de entorno
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
 
-// Para prueba: subir a tu chat personal
-const chatId = "me"; // ⚠️ cambiar luego al canal privado
+// Canal privado
+const chatId = Number(process.env.TELEGRAM_CHANNEL_ID); // -1003305031924
 
 const session = new StringSession(process.env.TELEGRAM_SESSION);
 const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
 
 let started = false;
 
-// Inicialización de Telegram
-export async function initTelegram() {
+async function initTelegram() {
   if (started) return;
   await client.connect();
   started = true;
-  console.log("Telegram listo (modo prueba en chat personal).");
+  console.log("Telegram conectado al canal privado.");
 }
 
-// Subir archivo a chat personal
 export async function uploadToTelegram(file) {
   try {
     await initTelegram();
 
-    const buffer = file.buffer;
-
+    // Enviar archivo
     const result = await client.sendFile(chatId, {
-      file: { _: "inputFile", data: buffer, name: file.originalname },
-      caption: "SnapCloud upload (prueba)"
+      file: { _: "inputFile", data: file.buffer, name: file.originalname },
+      caption: "SnapCloud upload"
     });
 
-    console.log("Archivo subido a Telegram:", result.id || result);
+    console.log("Archivo subido:", result.id || result);
     return result;
 
   } catch (err) {
