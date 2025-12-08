@@ -1,102 +1,61 @@
 import express from "express";
 import multer from "multer";
 import cors from "cors";
-import fetch from "node-fetch"; // ⚠️ Necesario instalar: npm install node-fetch
 import { uploadToTelegram } from "./uploader.js";
+import fs from "fs";
+import path from "path";
 
 const app = express();
-app.use(cors()); // permite que el frontend en Netlify haga requests
+app.use(cors());
 app.use(express.json());
 
-// Multer para archivos grandes
+// Crear carpeta temporal si no existe
+const uploadDir = path.join(process.cwd(), "uploads");
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+
+// Multer usando diskStorage
 const upload = multer({
-  storage: multer.memoryStorage(),
+  storage: multer.diskStorage({
+    destination: uploadDir,
+    filename: (req, file, cb) => cb(null, Date.now() + "_" + file.originalname)
+  }),
   limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
 });
 
-// Endpoint raíz
-app.get("/", (req, res) => res.send("SnapCloud Backend funcionando!"));
+const uploadedFiles = [];
 
-// ===== Registro de usuario =====
-app.post("/register", async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: "Datos incompletos" });
-
-    // Llamada a Apps Script para guardar usuario
-    const response = await fetch("TU_APPS_SCRIPT_URL", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "register", username, password })
-    });
-    const data = await response.json();
-    res.json(data);
-  } catch (err) {
-    console.error("Error en /register:", err);
-    res.status(500).json({ error: err.message });
-  }
+// Ruta raíz
+app.get("/", (req, res) => {
+  res.send("SnapCloud Backend funcionando!");
 });
 
-// ===== Login de usuario =====
-app.post("/login", async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: "Datos incompletos" });
-
-    // Llamada a Apps Script para validar usuario
-    const response = await fetch("TU_APPS_SCRIPT_URL", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "login", username, password })
-    });
-    const data = await response.json();
-    res.json(data);
-  } catch (err) {
-    console.error("Error en /login:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ===== Subida de archivos =====
+// Subir archivo
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
-    if (!req.file || !req.body.username) return res.status(400).json({ error: "Faltan datos" });
+    if (!req.file) return res.status(400).json({ error: "No file provided" });
 
-    const telegramResult = await uploadToTelegram(req.file);
-    const telegramFileId = telegramResult.id || telegramResult;
+    const result = await uploadToTelegram(req.file);
 
-    // Guardar metadata en Google Sheets vía Apps Script
-    await fetch("TU_APPS_SCRIPT_URL", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action: "upload",
-        username: req.body.username,
-        fileName: req.file.originalname,
-        telegramFileId
-      })
+    uploadedFiles.push({
+      id: result.id || result,
+      name: req.file.originalname
     });
 
-    res.json({ ok: true, fileId: telegramFileId, message: "Archivo subido correctamente" });
+    res.json({
+      ok: true,
+      fileId: result.id || result,
+      message: "Archivo subido correctamente al canal privado"
+    });
+
   } catch (err) {
     console.error("Error en /upload:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message || "Error subiendo archivo" });
   }
 });
 
-// ===== Listar archivos del usuario =====
-app.get("/files", async (req, res) => {
-  try {
-    const { username } = req.query;
-    if (!username) return res.status(400).json({ error: "Falta username" });
-
-    const response = await fetch("TU_APPS_SCRIPT_URL?action=list&username=" + encodeURIComponent(username));
-    const files = await response.json();
-    res.json(files);
-  } catch (err) {
-    console.error("Error en /files:", err);
-    res.status(500).json({ error: err.message });
-  }
+// Listar archivos subidos
+app.get("/files", (req, res) => {
+  res.json(uploadedFiles);
 });
 
 // Puerto asignado por Render
