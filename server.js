@@ -5,7 +5,7 @@ import { uploadToTelegram } from "./uploader.js";
 
 const app = express();
 
-// 🔹 Habilitar CORS globalmente para todos los endpoints
+// 🔹 Habilitar CORS globalmente
 app.use(cors()); // permite cualquier origen temporalmente
 app.use(express.json());
 
@@ -39,12 +39,12 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     res.json({
       ok: true,
       fileId: result.id || result,
-      message: "Archivo subido correctamente"
+      message: "Archivo subido correctamente al canal privado"
     });
 
   } catch (err) {
     console.error("Error en /upload:", err);
-    res.status(500).json({ error: "Error subiendo archivo" });
+    res.status(500).json({ error: err.message || "Error subiendo archivo" });
   }
 });
 
@@ -53,6 +53,6 @@ app.get("/files", (req, res) => {
   res.json(uploadedFiles);
 });
 
-// Puerto Render
+// Puerto asignado por Render
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Servidor iniciado en puerto " + PORT));
