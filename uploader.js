@@ -1,12 +1,11 @@
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
-import { Api } from "telegram/tl";
 
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
 const chatId = process.env.TELEGRAM_STORAGE_CHAT_ID;
 
-// ⚠️ ESTA ES TU SESIÓN PERMANENTE (la pegarás luego)
+// Sesión pre-generada en variable de entorno
 const session = new StringSession(process.env.TELEGRAM_SESSION);
 
 const client = new TelegramClient(session, apiId, apiHash, {
@@ -15,7 +14,6 @@ const client = new TelegramClient(session, apiId, apiHash, {
 
 let started = false;
 
-// Inicializar sin interacción
 export async function initTelegram() {
   if (started) return;
   await client.connect();
@@ -23,11 +21,10 @@ export async function initTelegram() {
   console.log("Telegram listo.");
 }
 
-// Subir archivo
 export async function uploadToTelegram(file) {
   await initTelegram();
 
-  const buffer = file.buffer; // Multer puede trabajar en memoria
+  const buffer = file.buffer; // Multer lo guarda en memoria
 
   const result = await client.sendFile(chatId, {
     file: {
