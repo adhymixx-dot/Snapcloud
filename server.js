@@ -8,13 +8,17 @@ import jwt from "jsonwebtoken";
 import { uploadToTelegram } from "./uploader.js";
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: "https://snapcloud.netlify.app" })); // ajusta tu frontend
 app.use(express.json());
 
-// Carpeta temporal para uploads
+// Carpeta para uploads permanentes
 const uploadDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
+// Servir archivos estáticos
+app.use("/uploads", express.static(uploadDir));
+
+// Configuración multer
 const upload = multer({
   storage: multer.diskStorage({
     destination: uploadDir,
@@ -30,12 +34,11 @@ const FILES_FILE = path.join(process.cwd(), "files.json");
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || "clave_super_secreta";
 
-// Leer o crear JSON
+// Leer/guardar JSON
 function readJSON(file) {
   if (!fs.existsSync(file)) return [];
   return JSON.parse(fs.readFileSync(file));
 }
-
 function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
@@ -89,20 +92,21 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file provided" });
 
+    // Subir a Telegram
     const result = await uploadToTelegram(req.file);
 
-    // Guardar metadata
+    // Guardar metadata incluyendo filename para mostrar miniaturas
     const files = readJSON(FILES_FILE);
     files.push({
       user_id: req.user.id,
       name: req.file.originalname,
+      filename: req.file.filename, // nombre guardado en uploads/
       telegram_id: result.id || result,
       created_at: new Date()
     });
     writeJSON(FILES_FILE, files);
 
     res.json({ ok: true, fileId: result.id || result, message: "Archivo subido correctamente" });
-
   } catch (err) {
     console.error("Error en /upload:", err);
     if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
