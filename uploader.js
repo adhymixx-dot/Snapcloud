@@ -1,48 +1,42 @@
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import { Api } from "telegram/tl";
-import fs from "fs";
 
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
 const chatId = process.env.TELEGRAM_STORAGE_CHAT_ID;
 
-const session = new StringSession(""); // vacío la primera vez
+// ⚠️ ESTA ES TU SESIÓN PERMANENTE (la pegarás luego)
+const session = new StringSession(process.env.TELEGRAM_SESSION);
+
 const client = new TelegramClient(session, apiId, apiHash, {
   connectionRetries: 5,
 });
 
-let clientStarted = false;
+let started = false;
 
+// Inicializar sin interacción
 export async function initTelegram() {
-  if (clientStarted) return;
-  clientStarted = true;
-
-  console.log("Iniciando sesión en Telegram...");
-
-  await client.start({
-    phoneNumber: async () => process.env.TELEGRAM_PHONE,
-    phoneCode: async () => {
-      console.log("Escribe el código que Telegram te envió:");
-      return await new Promise((resolve) => {
-        process.stdin.once("data", (d) => resolve(d.toString().trim()));
-      });
-    },
-    password: async () => process.env.TELEGRAM_2FA_PASSWORD
-  });
-
-  console.log("Sesión iniciada.");
+  if (started) return;
+  await client.connect();
+  started = true;
+  console.log("Telegram listo.");
 }
 
+// Subir archivo
 export async function uploadToTelegram(file) {
   await initTelegram();
 
+  const buffer = file.buffer; // Multer puede trabajar en memoria
+
   const result = await client.sendFile(chatId, {
-    file: file.path,
+    file: {
+      _: "inputFile",
+      data: buffer,
+      name: file.originalname
+    },
     caption: "SnapCloud upload"
   });
-
-  fs.unlinkSync(file.path);
 
   return result;
 }
