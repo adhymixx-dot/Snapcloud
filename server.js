@@ -22,7 +22,7 @@ const upload = multer({
 if (!fs.existsSync("temp")) fs.mkdirSync("temp");
 
 // URL de Apps Script
-const SHEETS_URL = "https://script.google.com/macros/s/AKfycbzacFUHkLrKbRa9LtswnbZRLZldgFUery-sACuBttXjUPTkuxg5FtU3Z48eRoF94NVF/exec"; // reemplaza con la tuya
+const SHEETS_URL = "https://script.google.com/macros/s/AKfycbyVVUlspr7pbtujmpjHUKH_8Ru18o2h_8jl2iuK0z_AOaC6BIC1SkGCLUbrAMEgPMH3/exec"; // reemplaza con la tuya
 
 // Ruta raíz
 app.get("/", (req, res) => res.send("SnapCloud Backend funcionando!"));
