@@ -1,4 +1,3 @@
-import 'dotenv/config'; // Cargar variables de entorno
 import express from "express";
 import multer from "multer";
 import cors from "cors";
@@ -11,7 +10,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Validar que las variables de entorno existan
+// Validar variables de entorno
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
   console.error("ERROR: Debes configurar SUPABASE_URL y SUPABASE_SERVICE_KEY en las variables de entorno");
   process.exit(1);
@@ -22,10 +21,10 @@ if (!process.env.TELEGRAM_API_ID || !process.env.TELEGRAM_API_HASH || !process.e
   process.exit(1);
 }
 
-// Conectar a Supabase (backend)
+// Conectar a Supabase
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// Carpeta temporal para archivos
+// Carpeta temporal
 const uploadDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
@@ -37,30 +36,28 @@ const upload = multer({
   limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
 });
 
-// Middleware para validar token Supabase
+// Middleware de autenticación Supabase
 async function authMiddleware(req, res, next) {
   const token = req.headers["authorization"]?.split("Bearer ")[1];
   if (!token) return res.status(401).json({ error: "No autorizado" });
 
-  const { data: user, error } = await supabase.auth.getUser(token);
-  if (error || !user) return res.status(401).json({ error: "No autorizado" });
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data.user) return res.status(401).json({ error: "No autorizado" });
 
-  req.user = user.user; // Objeto del usuario
+  req.user = data.user;
   next();
 }
 
 // Ruta raíz
 app.get("/", (req, res) => res.send("SnapCloud Backend funcionando!"));
 
-// Subida de archivo (solo usuarios logueados)
+// Subida de archivo
 app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file provided" });
 
-    // Subir a Telegram
     const result = await uploadToTelegram(req.file);
 
-    // Guardar metadata en Supabase
     const { error: insertError } = await supabase
       .from("files")
       .insert([{
@@ -69,26 +66,17 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
         telegram_id: result.id || result
       }]);
 
-    if (insertError) {
-      console.error("Error guardando en Supabase:", insertError);
-    }
+    if (insertError) console.error("Error guardando en Supabase:", insertError);
 
-    res.json({
-      ok: true,
-      fileId: result.id || result,
-      message: "Archivo subido correctamente"
-    });
-
+    res.json({ ok: true, fileId: result.id || result, message: "Archivo subido correctamente" });
   } catch (err) {
     console.error("Error en /upload:", err);
-    res.status(500).json({ error: err.message || "Error subiendo archivo" });
-
-    // Borrar archivo temporal si falla
     if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    res.status(500).json({ error: err.message || "Error subiendo archivo" });
   }
 });
 
-// Listar archivos del usuario
+// Listar archivos
 app.get("/files", authMiddleware, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -98,9 +86,7 @@ app.get("/files", authMiddleware, async (req, res) => {
       .order("created_at", { ascending: false });
 
     if (error) return res.status(500).json({ error: error.message });
-
     res.json(data);
-
   } catch (err) {
     console.error("Error en /files:", err);
     res.status(500).json({ error: err.message });
