@@ -1,41 +1,19 @@
-import 'dotenv/config';
 import express from "express";
 import multer from "multer";
 import cors from "cors";
 import fs from "fs";
 import path from "path";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
 import { uploadToTelegram } from "./uploader.js";
-import { createClient } from "@supabase/supabase-js";
 
 const app = express();
-
-// ---------------------
-// CORS
-// ---------------------
-app.use(cors({
-  origin: "https://snapcloud.netlify.app", // tu frontend
-  methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization"]
-}));
+app.use(cors());
 app.use(express.json());
 
-// ---------------------
-// Supabase
-// ---------------------
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
-  console.error("ERROR: Debes configurar SUPABASE_URL y SUPABASE_ANON_KEY");
-  process.exit(1);
-}
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
-
-// ---------------------
-// Carpetas
-// ---------------------
+// Carpeta temporal para uploads
 const uploadDir = path.join(process.cwd(), "uploads");
-const thumbDir = path.join(process.cwd(), "thumbnails");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-if (!fs.existsSync(thumbDir)) fs.mkdirSync(thumbDir);
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -45,84 +23,99 @@ const upload = multer({
   limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
 });
 
-// ---------------------
-// Middleware auth Supabase
-// ---------------------
-async function authMiddleware(req, res, next) {
+// Archivos JSON
+const USERS_FILE = path.join(process.cwd(), "users.json");
+const FILES_FILE = path.join(process.cwd(), "files.json");
+
+// JWT Secret
+const JWT_SECRET = process.env.JWT_SECRET || "clave_super_secreta";
+
+// Leer o crear JSON
+function readJSON(file) {
+  if (!fs.existsSync(file)) return [];
+  return JSON.parse(fs.readFileSync(file));
+}
+
+function writeJSON(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+// Middleware de autenticación
+function authMiddleware(req, res, next) {
   const token = req.headers["authorization"]?.split("Bearer ")[1];
   if (!token) return res.status(401).json({ error: "No autorizado" });
 
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data.user) return res.status(401).json({ error: "No autorizado" });
-
-  req.user = data.user;
-  next();
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Token inválido" });
+  }
 }
 
-// ---------------------
-// Rutas
-// ---------------------
-app.get("/", (req, res) => res.send("SnapCloud Backend funcionando!"));
+// Registro
+app.post("/register", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Email y password son requeridos" });
+
+  const users = readJSON(USERS_FILE);
+  if (users.find(u => u.email === email)) return res.status(400).json({ error: "Usuario ya existe" });
+
+  const hash = await bcrypt.hash(password, 10);
+  const newUser = { id: Date.now(), email, password: hash };
+  users.push(newUser);
+  writeJSON(USERS_FILE, users);
+
+  res.json({ ok: true, message: "Usuario registrado" });
+});
+
+// Login
+app.post("/login", async (req, res) => {
+  const { email, password } = req.body;
+  const users = readJSON(USERS_FILE);
+  const user = users.find(u => u.email === email);
+  if (!user) return res.status(400).json({ error: "Usuario no encontrado" });
+
+  const match = await bcrypt.compare(password, user.password);
+  if (!match) return res.status(400).json({ error: "Password incorrecto" });
+
+  const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
+  res.json({ ok: true, token });
+});
 
 // Subir archivo
 app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "No file provided" });
-
   try {
-    // Subir a Telegram
+    if (!req.file) return res.status(400).json({ error: "No file provided" });
+
     const result = await uploadToTelegram(req.file);
 
-    // Crear miniatura (solo imagen)
-    const ext = path.extname(req.file.filename).toLowerCase();
-    let thumbPath = null;
-    if (/\.(jpg|jpeg|png|gif)$/i.test(ext)) {
-      const sharp = await import("sharp");
-      thumbPath = path.join(thumbDir, req.file.filename + ".jpg");
-      await sharp.default(req.file.path).resize(200).toFile(thumbPath);
-    }
-
-    // Guardar metadata en Supabase
-    const { error: insertError } = await supabase
-      .from("files")
-      .insert([{
-        user_id: req.user.id,
-        filename: req.file.filename,
-        telegram_id: result.id || result,
-        thumb: thumbPath ? `/thumbnails/${req.file.filename}.jpg` : null
-      }]);
-
-    if (insertError) console.error("Error guardando en Supabase:", insertError);
-
-    res.json({
-      ok: true,
-      fileId: result.id || result,
-      filename: req.file.filename,
-      thumb: thumbPath ? `/thumbnails/${req.file.filename}.jpg` : null
+    // Guardar metadata
+    const files = readJSON(FILES_FILE);
+    files.push({
+      user_id: req.user.id,
+      name: req.file.originalname,
+      telegram_id: result.id || result,
+      created_at: new Date()
     });
+    writeJSON(FILES_FILE, files);
+
+    res.json({ ok: true, fileId: result.id || result, message: "Archivo subido correctamente" });
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Error subiendo archivo" });
+    console.error("Error en /upload:", err);
+    if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    res.status(500).json({ error: err.message || "Error subiendo archivo" });
   }
 });
 
 // Listar archivos del usuario
-app.get("/files", authMiddleware, async (req, res) => {
-  const { data, error } = await supabase
-    .from("files")
-    .select("*")
-    .eq("user_id", req.user.id)
-    .order("created_at", { ascending: false });
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+app.get("/files", authMiddleware, (req, res) => {
+  const files = readJSON(FILES_FILE).filter(f => f.user_id === req.user.id);
+  res.json(files);
 });
 
-// Servir miniaturas
-app.use("/thumbnails", express.static(thumbDir));
-
-// ---------------------
 // Servidor
-// ---------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor iniciado en puerto ${PORT}`));
