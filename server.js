@@ -1,19 +1,21 @@
 import express from "express";
 import multer from "multer";
 import cors from "cors";
-import { uploadToTelegram } from "./uploader.js";
 import fs from "fs";
 import path from "path";
+import { uploadToTelegram } from "./uploader.js";
+import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Crear carpeta temporal si no existe
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+// Carpeta temporal
 const uploadDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
-// Multer usando diskStorage
 const upload = multer({
   storage: multer.diskStorage({
     destination: uploadDir,
@@ -24,13 +26,23 @@ const upload = multer({
 
 const uploadedFiles = [];
 
-// Ruta raíz
-app.get("/", (req, res) => {
-  res.send("SnapCloud Backend funcionando!");
-});
+// Middleware para validar token Supabase
+async function authMiddleware(req, res, next) {
+  const token = req.headers["authorization"]?.split("Bearer ")[1];
+  if (!token) return res.status(401).json({ error: "No autorizado" });
 
-// Subir archivo
-app.post("/upload", upload.single("file"), async (req, res) => {
+  const { data: user, error } = await supabase.auth.getUser(token);
+  if (error || !user) return res.status(401).json({ error: "No autorizado" });
+
+  req.user = user;
+  next();
+}
+
+// Ruta raíz
+app.get("/", (req, res) => res.send("SnapCloud Backend funcionando!"));
+
+// Subir archivo (solo usuarios logueados)
+app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file provided" });
 
@@ -38,7 +50,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     uploadedFiles.push({
       id: result.id || result,
-      name: req.file.originalname
+      name: req.file.originalname,
+      user: req.user.user.id
     });
 
     res.json({
@@ -54,10 +67,10 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 });
 
 // Listar archivos subidos
-app.get("/files", (req, res) => {
-  res.json(uploadedFiles);
+app.get("/files", authMiddleware, (req, res) => {
+  const userFiles = uploadedFiles.filter(f => f.user === req.user.user.id);
+  res.json(userFiles);
 });
 
-// Puerto asignado por Render
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Servidor iniciado en puerto " + PORT));
