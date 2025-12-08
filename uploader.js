@@ -4,42 +4,33 @@ import fs from "fs";
 
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
-const chatId = Number(process.env.TELEGRAM_CHANNEL_ID);
+const sessionStr = process.env.TELEGRAM_SESSION; // tu string session
+const channelId = Number(process.env.TELEGRAM_CHANNEL_ID);
 
-const session = new StringSession(process.env.TELEGRAM_SESSION);
-const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
+const client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, {
+  connectionRetries: 5
+});
 
 let started = false;
-
-async function initTelegram() {
+async function initClient() {
   if (started) return;
-  await client.connect();
+  await client.start({ botAuthToken: process.env.TELEGRAM_BOT_TOKEN });
   started = true;
   console.log("Telegram conectado al canal privado.");
 }
 
+// Subir archivo
 export async function uploadToTelegram(file) {
-  try {
-    await initTelegram();
+  await initClient();
+  return await client.sendFile(channelId, {
+    file: file.path,
+    caption: file.originalname
+  });
+}
 
-    // Enviar archivo usando la ruta temporal
-    const result = await client.sendFile(chatId, {
-      file: file.path,
-      caption: "SnapCloud upload"
-    });
-
-    console.log("Archivo subido:", result.id || result);
-
-    // Borrar archivo temporal después de subir
-    fs.unlinkSync(file.path);
-
-    return result;
-
-  } catch (err) {
-    console.error("Error subiendo a Telegram:", err);
-
-    // Borrar archivo temporal si falla
-    if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
-    throw err;
-  }
+// Descargar archivo
+export async function downloadFromTelegram(fileId) {
+  await initClient();
+  const buffer = await client.downloadFile(fileId); // GramJS permite descargar a buffer
+  return buffer;
 }
