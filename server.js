@@ -2,20 +2,26 @@ import express from "express";
 import multer from "multer";
 import cors from "cors";
 import { uploadToTelegram } from "./uploader.js";
+import fs from "fs";
+import path from "path";
 
 const app = express();
-
-// Habilitar CORS globalmente
 app.use(cors());
 app.use(express.json());
 
-// Multer en memoria para archivos hasta 2GB
+// Crear carpeta temporal si no existe
+const uploadDir = path.join(process.cwd(), "uploads");
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+
+// Multer usando diskStorage
 const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 2 * 1024 * 1024 * 1024 }
+  storage: multer.diskStorage({
+    destination: uploadDir,
+    filename: (req, file, cb) => cb(null, Date.now() + "_" + file.originalname)
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
 });
 
-// Almacenar info de archivos subidos (opcional)
 const uploadedFiles = [];
 
 // Ruta raíz
