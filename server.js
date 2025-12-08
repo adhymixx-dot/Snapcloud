@@ -2,62 +2,22 @@
 import express from "express";
 import multer from "multer";
 import cors from "cors";
-import fetch from "node-fetch";
-import { uploadToTelegram } from "./uploader.js";
+import { uploadToTelegram } from "./uploader.js"; // tu archivo de subida a Telegram
 
 const app = express();
-app.use(cors());
+app.use(cors()); // permitir todas las solicitudes (temporalmente)
 app.use(express.json());
 
-// Multer para archivos grandes en memoria
+// Multer en memoria para archivos grandes
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
 });
 
-// URL de tu Apps Script
-const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxZED-LfBaRR1q3mpwX2WzALowmzVANnBDqq1wDfhJNoB0fTMo8j_B1ftPlf6eBbwdZ/exec";
-
-// Ruta raíz
+// ✅ Ruta raíz
 app.get("/", (req, res) => res.send("SnapCloud Backend funcionando!"));
 
-// Registrar usuario
-app.post("/register", async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: "Faltan datos" });
-
-    await fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "register", username, password })
-    });
-
-    res.json({ ok: true, message: "Usuario registrado correctamente" });
-  } catch (err) {
-    console.error("Error en /register:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Login usuario
-app.post("/login", async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: "Faltan datos" });
-
-    const response = await fetch(`${APPS_SCRIPT_URL}?action=login&username=${username}&password=${password}`);
-    const data = await response.json();
-
-    if (data.ok) res.json({ ok: true, message: "Login exitoso" });
-    else res.status(401).json({ error: "Usuario o contraseña incorrectos" });
-  } catch (err) {
-    console.error("Error en /login:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Subir archivo
+// 🔹 Subir archivo
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file provided" });
@@ -65,22 +25,25 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const telegramResult = await uploadToTelegram(req.file);
     const telegramFileId = telegramResult.id || telegramResult;
 
-    // Guardar metadata en Google Sheets
-    await fetch(APPS_SCRIPT_URL, {
+    // Guardar metadata en Google Sheets vía Apps Script
+    const scriptUrl = "https://script.google.com/macros/s/AKfycbxZED-LfBaRR1q3mpwX2WzALowmzVANnBDqq1wDfhJNoB0fTMo8j_B1ftPlf6eBbwdZ/exec";
+
+    const response = await fetch(scriptUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        action: "upload",
         username: req.body.userId,
         fileName: req.file.originalname,
         telegramFileId
       })
     });
 
+    await response.json(); // opcional: puedes manejar la respuesta de Apps Script
+
     res.json({
       ok: true,
       fileId: telegramFileId,
-      message: "Archivo subido y guardado correctamente"
+      message: "Archivo subido y metadata guardada correctamente"
     });
 
   } catch (err) {
@@ -89,14 +52,17 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// Listar archivos de un usuario
+// 🔹 Listar archivos de un usuario
 app.get("/files", async (req, res) => {
   try {
     const userId = req.query.userId;
-    if (!userId) return res.status(400).json({ error: "Falta userId" });
+    if (!userId) return res.status(400).json({ error: "No se proporcionó userId" });
 
-    const response = await fetch(`${APPS_SCRIPT_URL}?action=list&username=${userId}`);
+    // Llamada a tu Apps Script que devuelve los archivos de este usuario
+    const scriptUrl = `https://script.google.com/macros/s/AKfycbxZED-LfBaRR1q3mpwX2WzALowmzVANnBDqq1wDfhJNoB0fTMo8j_B1ftPlf6eBbwdZ/exec?username=${encodeURIComponent(userId)}`;
+    const response = await fetch(scriptUrl);
     const files = await response.json();
+
     res.json(files);
 
   } catch (err) {
@@ -105,6 +71,6 @@ app.get("/files", async (req, res) => {
   }
 });
 
-// Puerto asignado por Render
+// 🔹 Puerto asignado por Render
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Servidor iniciado en puerto " + PORT));
