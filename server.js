@@ -5,17 +5,17 @@ import { uploadToTelegram } from "./uploader.js";
 
 const app = express();
 
-// 🔹 Habilitar CORS globalmente
-app.use(cors()); // permite cualquier origen temporalmente
+// Habilitar CORS globalmente
+app.use(cors());
 app.use(express.json());
 
-// Multer en memoria para archivos grandes
+// Multer en memoria para archivos hasta 2GB
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }
 });
 
-// Para guardar info de archivos subidos (solo localmente)
+// Almacenar info de archivos subidos (opcional)
 const uploadedFiles = [];
 
 // Ruta raíz
@@ -30,7 +30,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     const result = await uploadToTelegram(req.file);
 
-    // Guardar info básica
     uploadedFiles.push({
       id: result.id || result,
       name: req.file.originalname

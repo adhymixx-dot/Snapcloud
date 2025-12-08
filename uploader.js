@@ -22,8 +22,8 @@ export async function uploadToTelegram(file) {
     await initTelegram();
 
     const result = await client.sendFile(chatId, {
-      file: file.buffer,               // Buffer directo desde Multer
-      filename: file.originalname,     // nombre del archivo en Telegram
+      file: file.buffer,               // Multer en memoria
+      filename: file.originalname,     // nombre en Telegram
       caption: "SnapCloud upload"
     });
 
@@ -32,6 +32,6 @@ export async function uploadToTelegram(file) {
 
   } catch (err) {
     console.error("Error subiendo a Telegram:", err);
-    throw err; // esto hará que el backend devuelva 500 si falla
+    throw err;
   }
 }
