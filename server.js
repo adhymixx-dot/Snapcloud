@@ -1,14 +1,14 @@
 import express from "express";
 import multer from "multer";
-import cors from "cors";  // 🔹 Importar CORS
+import cors from "cors"; // 🔹 Importar cors
 import { uploadToTelegram } from "./uploader.js";
 
 const app = express();
 app.use(express.json());
 
-// 🔹 Habilitar CORS
+// 🔹 Habilitar CORS para tu frontend
 app.use(cors({
-    origin: "https://snapcloud.netlify.app", // 🔹 Solo tu frontend
+    origin: "https://snapcloud.netlify.app", // reemplaza con la URL de tu Netlify
     methods: ["GET","POST"]
 }));
 
@@ -35,11 +35,11 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     });
 
   } catch (err) {
-    console.error("Error en /upload:", err);
+    console.error(err);
     res.status(500).json({ error: "Error subiendo archivo" });
   }
 });
 
-// Puerto Render
+// Puerto asignado por Render
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Servidor iniciado en puerto " + PORT));
