@@ -3,9 +3,7 @@ import { StringSession } from "telegram/sessions/index.js";
 
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
-
-// Canal privado
-const chatId = Number(process.env.TELEGRAM_CHANNEL_ID); // -1003305031924
+const chatId = Number(process.env.TELEGRAM_CHANNEL_ID); // tu canal privado
 
 const session = new StringSession(process.env.TELEGRAM_SESSION);
 const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
@@ -23,9 +21,9 @@ export async function uploadToTelegram(file) {
   try {
     await initTelegram();
 
-    // Enviar archivo
     const result = await client.sendFile(chatId, {
-      file: { _: "inputFile", data: file.buffer, name: file.originalname },
+      file: file.buffer,               // Buffer directo desde Multer
+      filename: file.originalname,     // nombre del archivo en Telegram
       caption: "SnapCloud upload"
     });
 
@@ -34,6 +32,6 @@ export async function uploadToTelegram(file) {
 
   } catch (err) {
     console.error("Error subiendo a Telegram:", err);
-    throw err; // Esto hace que el backend devuelva 500 si falla
+    throw err; // esto hará que el backend devuelva 500 si falla
   }
 }
