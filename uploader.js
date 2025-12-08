@@ -6,7 +6,7 @@ const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
 const chatId = "me"; // Subir a tu propio chat
 
-// Session ya generada previamente
+// Session generada previamente
 const session = new StringSession(process.env.TELEGRAM_SESSION);
 const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
 
