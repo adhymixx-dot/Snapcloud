@@ -1,63 +1,57 @@
-import express from "express";
-import multer from "multer";
-import cors from "cors";
-import { uploadToTelegram } from "./uploader.js";
-import fs from "fs";
-import path from "path";
+import { TelegramClient } from "telegram";
+import { StringSession } from "telegram/sessions/index.js";
+import fs from "fs/promises"; // Usar la versión de promesas para operaciones asíncronas
+import fsSync from "fs"; // Usar sync version para path check en el fallback
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const apiId = Number(process.env.TELEGRAM_API_ID);
+const apiHash = process.env.TELEGRAM_API_HASH;
+const chatId = Number(process.env.TELEGRAM_CHANNEL_ID);
 
-// Crear carpeta temporal si no existe
-const uploadDir = path.join(process.cwd(), "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+const session = new StringSession(process.env.TELEGRAM_SESSION);
+const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
 
-// Multer usando diskStorage
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: uploadDir,
-    filename: (req, file, cb) => cb(null, Date.now() + "_" + file.originalname)
-  }),
-  limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
-});
+let started = false;
 
-const uploadedFiles = [];
+async function initTelegram() {
+  if (started) return;
+  await client.connect();
+  started = true;
+  console.log("Telegram conectado al canal privado.");
+}
 
-// Ruta raíz
-app.get("/", (req, res) => {
-  res.send("SnapCloud Backend funcionando!");
-});
-
-// Subir archivo
-app.post("/upload", upload.single("file"), async (req, res) => {
+export async function uploadToTelegram(file) {
   try {
-    if (!req.file) return res.status(400).json({ error: "No file provided" });
+    await initTelegram();
 
-    const result = await uploadToTelegram(req.file);
-
-    uploadedFiles.push({
-      id: result.id || result,
-      name: req.file.originalname
+    // Enviar archivo usando la ruta temporal
+    console.log(`Subiendo archivo ${file.originalname} desde ${file.path}...`);
+    const result = await client.sendFile(chatId, {
+      file: file.path,
+      caption: `SnapCloud upload: ${file.originalname}`
     });
 
-    res.json({
-      ok: true,
-      fileId: result.id || result,
-      message: "Archivo subido correctamente al canal privado"
-    });
+    console.log("Archivo subido:", result.id || result);
+
+    // Borrar archivo temporal después de subir (de forma asíncrona)
+    await fs.unlink(file.path);
+    console.log(`Archivo temporal ${file.path} borrado.`);
+
+    return result;
 
   } catch (err) {
-    console.error("Error en /upload:", err);
-    res.status(500).json({ error: err.message || "Error subiendo archivo" });
+    console.error("Error subiendo a Telegram:", err);
+
+    // Borrar archivo temporal si falla
+    if (fsSync.existsSync(file.path)) {
+      try {
+         await fs.unlink(file.path);
+         console.log(`Archivo temporal ${file.path} borrado tras el error.`);
+      } catch (cleanupErr) {
+         console.error("Error al intentar borrar el archivo temporal:", cleanupErr);
+      }
+    }
+
+    // Re-lanzar el error para que el servidor.js lo maneje
+    throw new Error(`Fallo al subir archivo a Telegram: ${err.message}`);
   }
-});
-
-// Listar archivos subidos
-app.get("/files", (req, res) => {
-  res.json(uploadedFiles);
-});
-
-// Puerto asignado por Render
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Servidor iniciado en puerto " + PORT));
+}
