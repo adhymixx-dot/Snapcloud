@@ -1,20 +1,19 @@
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import fs from "fs";
-import sharp from "sharp";
+import sharp from "sharp"; // Para miniaturas de imágenes
 import ffmpeg from "fluent-ffmpeg";
 import path from "path";
 
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
-const userChannelId = BigInt(process.env.TELEGRAM_USER_CHANNEL);
-const botChannelId = BigInt(process.env.TELEGRAM_BOT_CHANNEL);
+const botChannelId = BigInt(process.env.TELEGRAM_BOT_CHANNEL); // Canal donde el bot guarda miniaturas
+const userChannelId = BigInt(process.env.TELEGRAM_USER_CHANNEL); // Canal donde se suben archivos originales
 
 const session = new StringSession(process.env.TELEGRAM_SESSION);
 const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
 
 let started = false;
-
 async function initTelegram() {
   if (started) return;
   await client.connect();
@@ -22,57 +21,66 @@ async function initTelegram() {
   console.log("Telegram conectado.");
 }
 
+/**
+ * Genera miniatura de imagen o video
+ * @param {string} filePath
+ * @param {string} type "image" | "video"
+ * @returns {Promise<string>} ruta del archivo miniatura
+ */
+function generateThumbnail(filePath, type) {
+  return new Promise((resolve, reject) => {
+    const thumbPath = filePath + "_thumb.jpg";
+    if (type === "image") {
+      sharp(filePath)
+        .resize(200, 200, { fit: "cover" })
+        .toFile(thumbPath)
+        .then(() => resolve(thumbPath))
+        .catch(reject);
+    } else if (type === "video") {
+      ffmpeg(filePath)
+        .screenshots({
+          count: 1,
+          folder: path.dirname(filePath),
+          filename: path.basename(thumbPath),
+          size: "200x200"
+        })
+        .on("end", () => resolve(thumbPath))
+        .on("error", reject);
+    } else reject(new Error("Tipo desconocido para miniatura"));
+  });
+}
+
+/**
+ * Sube archivo y miniatura a Telegram
+ * @param {object} file multer file
+ */
 export async function uploadFile(file) {
   await initTelegram();
+  const type = file.mimetype.startsWith("video") ? "video" : "image";
 
-  // ---- Subir archivo original al canal del usuario ----
-  const fileResult = await client.sendFile(userChannelId, {
+  // Generar miniatura local
+  const thumbPath = await generateThumbnail(file.path, type);
+
+  // Subir archivo original al canal del usuario
+  const resultOriginal = await client.sendFile(userChannelId, {
     file: file.path,
-    caption: "SnapCloud upload",
-    filename: file.originalname // <- CORRECCIÓN IMPORTANTE
+    caption: "Archivo SnapCloud"
   });
 
-  // ---- Generar miniatura ----
-  let thumbPath;
-  let type;
-
-  if (file.mimetype.startsWith("image")) {
-    thumbPath = file.path + "_thumb.jpg";
-    await sharp(file.path)
-      .resize(200)
-      .toFile(thumbPath);
-    type = "image";
-  } else if (file.mimetype.startsWith("video")) {
-    thumbPath = path.join(path.dirname(file.path), path.parse(file.originalname).name + "_thumb.jpg");
-    await new Promise((resolve, reject) => {
-      ffmpeg(file.path)
-        .screenshots({
-          timestamps: ["50%"],
-          filename: path.basename(thumbPath),
-          folder: path.dirname(thumbPath),
-          size: "200x?"
-        })
-        .on("end", resolve)
-        .on("error", reject);
-    });
-    type = "video";
-  }
-
-  // ---- Subir miniatura al canal del bot ----
-  const thumbResult = await client.sendFile(botChannelId, {
+  // Subir miniatura al canal del bot
+  const resultThumb = await client.sendFile(botChannelId, {
     file: thumbPath,
-    filename: path.basename(thumbPath)
+    caption: "Miniatura"
   });
 
-  // ---- Limpiar archivos temporales ----
+  // Limpiar archivos locales
   fs.unlinkSync(file.path);
-  if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
+  fs.unlinkSync(thumbPath);
 
-  // ---- Retornar datos para frontend ----
   return {
     name: file.originalname,
-    fileId: fileResult.id || fileResult,
-    thumbId: thumbResult.id || thumbResult,
+    fileId: resultOriginal.id, // Para descargar/reproducir
+    thumbId: resultThumb.id,   // Para mostrar en galería
     type
   };
 }
