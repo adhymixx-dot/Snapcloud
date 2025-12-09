@@ -45,39 +45,39 @@ function writeJSON(file, data) {
 }
 
 // ⚠️ FUNCIÓN AUXILIAR CRUCIAL: Extraer el file_id del objeto de respuesta de GramJS
-// Esta función fue mejorada para evitar el error de 'undefined'
+// FIX: Maneja el objeto Integer de GramJS para extraer el ID de archivo.
 function extractFileId(messageResult) {
     if (!messageResult || !messageResult.media) {
-        // En este punto, si la subida fue exitosa, messageResult.media no debería ser nulo.
-        // Podría ser un error de la subida misma.
         console.error("Error al extraer ID: messageResult o media es nulo/indefinido.", messageResult);
         return null;
     }
 
-    let media = null;
     let fileId = null;
 
     if (messageResult.media.photo) {
-        // Para fotos/miniaturas, usamos el ID de la foto con mejor calidad (la última en el array sizes)
+        // Para fotos, el ID de archivo real para la API HTTP es el 'id' del último PhotoSize (el más grande/mejor calidad).
         const sizes = messageResult.media.photo.sizes;
-        media = sizes[sizes.length - 1]; 
-        fileId = media?.id; // El ID de la foto es el 'id' del PhotoSize
+        if (sizes && sizes.length > 0) {
+            // El ID de archivo de Telegram para la API HTTP es el campo 'id' dentro de PhotoSize.
+            const largestSize = sizes[sizes.length - 1];
+            fileId = largestSize.id; 
+        }
     } else if (messageResult.media.document) {
-        // Para documentos, el ID es el 'id' del Documento
-        media = messageResult.media.document;
-        fileId = media?.id;
+        // Para documentos, el ID es el del documento.
+        fileId = messageResult.media.document.id;
     } else if (messageResult.media.video) {
-        // Para videos, el ID es el 'id' del Video
-        media = messageResult.media.video;
-        fileId = media?.id;
+        // Para videos, el ID es el del video.
+        fileId = messageResult.media.video.id;
     }
 
-    // Si encontramos un ID, lo convertimos a string (ya que es un BigInt en GramJS)
+    // El fileId es un objeto Integer o BigInt. Debemos convertirlo a string.
     if (fileId) {
-        return fileId.toString();
+        // Si es un objeto GramJS 'Integer', su valor está en .value. Si es un BigInt nativo, lo toma directo.
+        const idValue = fileId.value || fileId;
+        return idValue.toString();
     }
     
-    console.warn("Media desconocida o ID de archivo no encontrado en el mensaje:", messageResult.media);
+    console.warn("ID de archivo no encontrado o media desconocida:", messageResult.media);
     return null; 
 }
 
