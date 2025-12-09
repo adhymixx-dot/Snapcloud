@@ -5,7 +5,7 @@ import fs from "fs";
 import path from "path";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-// Importar funciones de uploader.js (Deben ser 3 funciones)
+// Importar funciones de uploader.js
 import { uploadToTelegram, uploadThumbnail, getFileUrl } from "./uploader.js"; 
 // Importar funciones de thumbnailer.js
 import { generateThumbnail, cleanupThumbnail } from "./thumbnailer.js"; 
@@ -48,38 +48,6 @@ function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-// 🔑 FUNCIÓN DE EXTRACCIÓN DE ID (CORREGIDA)
-function extractFileId(messageResult) {
-    if (!messageResult || !messageResult.media) {
-        console.error("Error al extraer ID: messageResult o media es nulo/indefinido.", messageResult);
-        return null;
-    }
-
-    let fileId = null;
-
-    if (messageResult.media.photo && messageResult.media.photo.id) {
-        // Para fotos/miniaturas: Usamos el ID del objeto Photo principal.
-        fileId = messageResult.media.photo.id;
-    } else if (messageResult.media.document && messageResult.media.document.id) {
-        // Para documentos/archivos grandes
-        fileId = messageResult.media.document.id;
-    } else if (messageResult.media.video && messageResult.media.video.id) {
-        // Para videos
-        fileId = messageResult.media.video.id;
-    }
-
-    // CLAVE: Convertir el objeto Integer/BigInt de GramJS a string.
-    if (fileId) {
-        // Si tiene una propiedad 'value' (objeto GramJS.Integer), la usamos.
-        const idValue = fileId.value ? fileId.value : fileId; 
-        return idValue.toString();
-    }
-    
-    console.warn("ID de archivo no encontrado o media desconocida:", messageResult.media);
-    return null; 
-}
-
-
 // Middleware de autenticación
 function authMiddleware(req, res, next) {
   const token = req.headers["authorization"]?.split("Bearer ")[1];
@@ -94,7 +62,7 @@ function authMiddleware(req, res, next) {
   }
 }
 
-// Registro/Login (Omitido por brevedad, asumimos que están correctos)
+// Registro
 app.post("/register", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email y password son requeridos" });
@@ -107,6 +75,7 @@ app.post("/register", async (req, res) => {
   res.json({ ok: true, message: "Usuario registrado" });
 });
 
+// Login
 app.post("/login", async (req, res) => {
   const { email, password } = req.body;
   const users = readJSON(USERS_FILE);
@@ -119,7 +88,7 @@ app.post("/login", async (req, res) => {
 });
 
 
-// 🚀 RUTA CRUCIAL DE SUBIDA 🚀
+// 🚀 RUTA CRUCIAL DE SUBIDA (CORREGIDA) 🚀
 app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   let thumbPath = null;
   
@@ -129,15 +98,19 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
     // PASO 1: Generar la miniatura
     thumbPath = await generateThumbnail(req.file);
 
-    // PASO 2: Subir la miniatura y obtener su ID.
+    // PASO 2: Subir la miniatura y obtener su ID (largo y correcto).
     const thumbnailResult = await uploadThumbnail(thumbPath); 
-    const thumbnailId = extractFileId(thumbnailResult); 
-    if (!thumbnailId) throw new Error("No se pudo obtener el ID del archivo de la miniatura (Foto). La respuesta de Telegram no contiene la entidad multimedia esperada.");
+    // ✅ CLAVE: Usamos .telegram_id que devuelve el ID único para la API HTTP del Bot
+    const thumbnailId = thumbnailResult.telegram_id; 
+    
+    if (!thumbnailId) throw new Error("No se pudo obtener el ID del archivo de la miniatura.");
 
-    // 🚀 PASO 3: Subir el archivo original al canal del usuario (si la miniatura funcionó)
+    // 🚀 PASO 3: Subir el archivo original al canal del usuario
     const originalResult = await uploadToTelegram(req.file);
-    const originalId = extractFileId(originalResult);
-    if (!originalId) throw new Error("No se pudo obtener el ID del archivo original (Documento/Video). Posiblemente falló la subida grande.");
+    // ✅ CLAVE: Usamos .telegram_id que devuelve el ID único para la API HTTP del Bot
+    const originalId = originalResult.telegram_id; 
+
+    if (!originalId) throw new Error("No se pudo obtener el ID del archivo original.");
 
     // PASO 4: Guardar metadata y limpiar
     const files = readJSON(FILES_FILE);
@@ -146,8 +119,8 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
       user_id: req.user.id,
       name: req.file.originalname,
       mime: req.file.mimetype,
-      thumbnail_id: thumbnailId,   // ID de archivo (string)
-      telegram_id: originalId,     // ID de archivo (string)
+      thumbnail_id: thumbnailId,   // ID de archivo (string largo y correcto)
+      telegram_id: originalId,     // ID de archivo (string largo y correcto)
       created_at: new Date()
     });
     writeJSON(FILES_FILE, files);
@@ -161,7 +134,7 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
     console.error("Error en /upload:", err);
     // Asegurar limpieza en caso de error
     if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-    if (thumbPath) cleanupThumbnail(thumbPath);
+    if (thumbPath && fs.existsSync(thumbPath)) cleanupThumbnail(thumbPath);
     res.status(500).json({ error: err.message || "Error subiendo archivo" });
   }
 });
