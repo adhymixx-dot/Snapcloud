@@ -5,12 +5,13 @@ import fs from "fs";
 import path from "path";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-// Importar funciones de uploader.js
-import { uploadToTelegram, uploadThumbnail, getFileUrl } from "./uploader.js"; 
-// Importar funciones de thumbnailer.js
+// Importar funciones de uploader.js, incluyendo streamFile
+import { uploadToTelegram, uploadThumbnail, getFileUrl, streamFile } from "./uploader.js"; 
+// Importar funciones de thumbnailer.js (asumo que thumbnailer.js existe y funciona)
 import { generateThumbnail, cleanupThumbnail } from "./thumbnailer.js"; 
 
 const app = express();
+// Configura el CORS con tu URL de Netlify
 app.use(cors({ origin: "https://snapcloud.netlify.app" })); 
 app.use(express.json());
 
@@ -27,7 +28,7 @@ const upload = multer({
   limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
 });
 
-// Archivos JSON
+// Archivos JSON (Recuerda: ¡Son volátiles en Render!)
 const USERS_FILE = path.join(process.cwd(), "users.json");
 const FILES_FILE = path.join(process.cwd(), "files.json");
 
@@ -88,7 +89,7 @@ app.post("/login", async (req, res) => {
 });
 
 
-// 🚀 RUTA CRUCIAL DE SUBIDA 🚀
+// 🚀 RUTA DE SUBIDA (Actualizada para guardar message_id) 🚀
 app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   let thumbPath = null;
   
@@ -98,15 +99,16 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
     // PASO 1: Generar la miniatura
     thumbPath = await generateThumbnail(req.file);
 
-    // PASO 2: Subir la miniatura y obtener su ID (largo y correcto).
+    // PASO 2: Subir la miniatura 
     const thumbnailResult = await uploadThumbnail(thumbPath); 
     const thumbnailId = thumbnailResult.telegram_id; 
     
     if (!thumbnailId) throw new Error("No se pudo obtener el ID del archivo de la miniatura.");
 
-    // 🚀 PASO 3: Subir el archivo original al canal del usuario
+    // 🚀 PASO 3: Subir el archivo original
     const originalResult = await uploadToTelegram(req.file);
     const originalId = originalResult.telegram_id; 
+    const messageId = originalResult.message_id; // <-- ID de mensaje para streaming
 
     if (!originalId) throw new Error("No se pudo obtener el ID del archivo original.");
 
@@ -117,8 +119,9 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
       user_id: req.user.id,
       name: req.file.originalname,
       mime: req.file.mimetype,
-      thumbnail_id: thumbnailId,   // ID de archivo (string largo y correcto)
-      telegram_id: originalId,     // ID de archivo (string largo y correcto)
+      thumbnail_id: thumbnailId,   // ID de Bot API (largo)
+      telegram_id: originalId,     // ID de Bot API (largo)
+      message_id: messageId,       // ID de Mensaje (corto) - CRUCIAL PARA STREAMING
       created_at: new Date()
     });
     writeJSON(FILES_FILE, files);
@@ -127,7 +130,7 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
     fs.unlinkSync(req.file.path);
     cleanupThumbnail(thumbPath);
 
-    res.json({ ok: true, fileId: originalId, thumbnailId: thumbnailId, message: "Archivo subido correctamente" });
+    res.json({ ok: true, message: "Archivo subido correctamente" });
   } catch (err) {
     console.error("Error en /upload:", err);
     // Asegurar limpieza en caso de error
@@ -143,7 +146,7 @@ app.get("/files", authMiddleware, (req, res) => {
   res.json(files);
 });
 
-// Ruta CRUCIAL: Obtener URL de la CDN de Telegram
+// Ruta 🖼️: Obtener URL de la CDN de Telegram (Solo archivos pequeños/miniaturas)
 app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     try {
         const fileId = req.params.file_id;
@@ -152,6 +155,35 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     } catch (error) {
         console.error("Error en /file-url:", error.message);
         res.status(500).json({ error: error.message || "Error al obtener la URL del archivo de Telegram" });
+    }
+});
+
+// 🎥 NUEVA RUTA: Streaming de archivos grandes (Usa el Cliente de Usuario)
+app.get("/stream/:message_id", authMiddleware, async (req, res) => {
+    try {
+        const messageId = req.params.message_id;
+
+        // 1. Buscar metadata para obtener el MIME type
+        const files = readJSON(FILES_FILE);
+        const fileData = files.find(f => f.message_id == messageId);
+
+        if (!fileData) {
+            return res.status(404).json({ error: "Archivo no encontrado" });
+        }
+        
+        // 2. Establecer el Content-Type para el navegador
+        res.setHeader('Content-Type', fileData.mime);
+
+        // 3. Iniciar el streaming usando el cliente de usuario (sin límite de 20MB)
+        await streamFile(messageId, res);
+    } catch (error) {
+        console.error("Error en streaming:", error.message);
+        // Si la conexión se cerró antes de enviar los headers, simplemente terminamos.
+        if (!res.headersSent) {
+            res.status(500).json({ error: "Error en el streaming del archivo" });
+        } else {
+            res.end();
+        }
     }
 });
 

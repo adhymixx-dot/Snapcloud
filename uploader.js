@@ -33,24 +33,19 @@ async function initClient() {
 }
 
 /**
- * 🔑 NUEVA ESTRATEGIA: Obtener file_id usando la API del Bot (forwardMessage).
- * Esto garantiza un ID compatible 100% con la API de descarga.
+ * 🔑 Estrategia robusta: Obtener file_id usando la Bot API (forwardMessage).
  */
 async function getTelegramFileId(messageId, channelIdBigInt) {
     if (!BOT_TOKEN) throw new Error("BOT_TOKEN no configurado.");
 
-    // Convertir BigInt a String para la API HTTP
     const channelIdStr = channelIdBigInt.toString(); 
-    // Nota: Para la API del Bot, los canales deben empezar con -100.
-    // GramJS usa BigInts que ya incluyen el -100 o no, asegúrate de que tu variable de entorno lo tenga.
     
     // 1. Reenviamos el mensaje al mismo canal usando el Bot
-    // (Usamos el mismo canal como destino temporal)
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`;
     const params = {
-        chat_id: channelIdStr,      // Destino (mismo canal)
-        from_chat_id: channelIdStr, // Origen (mismo canal)
-        message_id: messageId       // ID del mensaje que acabamos de subir
+        chat_id: channelIdStr,
+        from_chat_id: channelIdStr,
+        message_id: messageId
     };
 
     try {
@@ -95,16 +90,18 @@ async function getTelegramFileId(messageId, channelIdBigInt) {
 
     } catch (err) {
         console.error("Fallo al obtener file_id vía Bot API:", err);
-        throw err; // Re-lanzar para manejar en server.js
+        throw err;
     }
 }
 
 // --- FUNCIONES DE EXPORTACIÓN ---
 
+/**
+ * 🚀 Sube el archivo original y devuelve un objeto con el file_id correcto y message_id.
+ */
 export async function uploadToTelegram(file) {
   try {
     await initClient(); 
-    // Subir como documento para preservar calidad y evitar compresión
     const messageResult = await client.sendFile(chatId, { 
         file: file.path, 
         caption: "SnapCloud upload", 
@@ -117,7 +114,7 @@ export async function uploadToTelegram(file) {
     
     return { 
         telegram_id: fileId,
-        message_id: messageResult.id 
+        message_id: messageResult.id // Este ID es CRUCIAL para el streaming
     };
   } catch (err) {
     console.error("Error subiendo archivo GRANDE a Telegram:", err);
@@ -125,6 +122,9 @@ export async function uploadToTelegram(file) {
   }
 }
 
+/**
+ * 🖼️ Sube la miniatura y devuelve un objeto con el file_id correcto y message_id.
+ */
 export async function uploadThumbnail(thumbPath) {
   try {
     await initClient(); 
@@ -148,6 +148,10 @@ export async function uploadThumbnail(thumbPath) {
   }
 }
 
+/**
+ * 🔗 Obtiene la URL de descarga de la CDN de Telegram (USA LA API HTTP DEL BOT).
+ * Funciona solo para archivos < 20MB (miniaturas/imágenes pequeñas).
+ */
 export async function getFileUrl(fileId) {
     if (!BOT_TOKEN) throw new Error("BOT_TOKEN no configurado.");
     
@@ -169,4 +173,40 @@ export async function getFileUrl(fileId) {
         console.error("Error en getFileUrl:", error.message);
         throw error;
     }
+}
+
+/**
+ * 🎥 STREAMING: Descarga el archivo usando el Cliente de Usuario (sin límite de tamaño)
+ * y lo escribe directamente en la respuesta del servidor (res).
+ */
+export async function streamFile(messageId, res) {
+    await initClient();
+
+    // 1. Obtenemos el mensaje original para acceder al medio
+    const messages = await client.getMessages(chatId, { ids: [Number(messageId)] });
+    const message = messages[0];
+
+    if (!message || !message.media) {
+        throw new Error("Mensaje o archivo no encontrado en Telegram");
+    }
+
+    const media = message.media.document || message.media.video || message.media.photo;
+    
+    // 2. Usamos iterDownload para bajarlo por pedazos y enviarlo al navegador
+    const stream = client.iterDownload(media, {
+        chunkSize: 128 * 1024, // 128KB chunks
+    });
+    
+    // Si el cliente cierra la conexión, terminamos el stream.
+    res.on('close', () => {
+         // Aseguramos que no haya más escritura si el cliente se desconecta
+         res.end(); 
+    });
+
+    for await (const chunk of stream) {
+        // Escribimos cada pedazo en la respuesta HTTP
+        res.write(chunk);
+    }
+    
+    res.end();
 }
