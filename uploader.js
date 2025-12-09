@@ -1,6 +1,5 @@
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
-import { Api } from "telegram/tl/index.js";
 import fs from "fs";
 
 // --- VALIDACIÓN DE VARIABLES ---
@@ -12,13 +11,16 @@ function getRequiredBigInt(varName) {
     return BigInt(value);
 }
 
-// --- CONFIGURACIÓN DEL CLIENTE ÚNICO (USUARIO) ---
+// --- CONFIGURACIÓN ---
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
+// ID de canales
 const chatId = getRequiredBigInt("TELEGRAM_CHANNEL_ID"); 
 const botChatId = getRequiredBigInt("BOT_CHANNEL_ID"); 
+// Token del Bot
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
+// Cliente de Usuario (MTProto)
 const session = new StringSession(process.env.TELEGRAM_SESSION);
 const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
 
@@ -31,49 +33,70 @@ async function initClient() {
 }
 
 /**
- * 🔑 Función crucial: Extrae el ID de archivo global (file_id) para la API HTTP del Bot.
+ * 🔑 NUEVA ESTRATEGIA: Obtener file_id usando la API del Bot (forwardMessage).
+ * Esto garantiza un ID compatible 100% con la API de descarga.
  */
-async function getTelegramFileId(messageResult) {
-    await initClient();
+async function getTelegramFileId(messageId, channelIdBigInt) {
+    if (!BOT_TOKEN) throw new Error("BOT_TOKEN no configurado.");
 
-    if (!messageResult || !messageResult.media) {
-        throw new Error("El resultado del mensaje de Telegram está incompleto para extraer el file_id.");
-    }
+    // Convertir BigInt a String para la API HTTP
+    const channelIdStr = channelIdBigInt.toString(); 
+    // Nota: Para la API del Bot, los canales deben empezar con -100.
+    // GramJS usa BigInts que ya incluyen el -100 o no, asegúrate de que tu variable de entorno lo tenga.
     
-    let fileMedia = messageResult.media.document || messageResult.media.photo || messageResult.media.video;
+    // 1. Reenviamos el mensaje al mismo canal usando el Bot
+    // (Usamos el mismo canal como destino temporal)
+    const url = `https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`;
+    const params = {
+        chat_id: channelIdStr,      // Destino (mismo canal)
+        from_chat_id: channelIdStr, // Origen (mismo canal)
+        message_id: messageId       // ID del mensaje que acabamos de subir
+    };
 
-    if (!fileMedia) {
-         throw new Error("No se encontró Documento, Foto o Video en el objeto media.");
-    }
-    
-    // CORRECCIÓN del TypeError: asegurar que seleccionamos el tamaño correcto de la foto.
-    if (messageResult.media.photo) {
-        const validSizes = messageResult.media.photo.sizes.filter(s => s && s.bytes); 
-        
-        if (validSizes.length === 0) {
-            throw new Error("No se encontraron tamaños válidos para la foto (miniatura).");
-        }
-        
-        fileMedia = validSizes.reduce((prev, current) => {
-            return prev.bytes > current.bytes ? prev : current; 
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params)
         });
-    }
+        const data = await response.json();
 
-    // Usamos el objeto fileMedia final (el documento, video o el tamaño de foto más grande)
-    const fileId = new Api.InputFileLocation({
-        id: fileMedia.id,
-        accessHash: fileMedia.accessHash,
-        fileReference: fileMedia.fileReference || Buffer.from([]),
-    });
-    
-    // ✅ CORRECCIÓN FINAL: Acceso seguro a la utilidad de codificación de ID.
-    const telegramUtils = client.session.get.telegram && client.session.get.telegram.utils;
+        if (!data.ok) {
+            throw new Error(`Error Bot API forwardMessage: ${data.description}`);
+        }
 
-    if (!telegramUtils || typeof telegramUtils.getFileIdForStore !== 'function') {
-        throw new Error("CRÍTICO: No se pudo acceder a la utilidad interna de GramJS para codificar el ID de archivo. Intenta reiniciar el servicio.");
+        const forwardedMsg = data.result;
+        
+        // 2. Extraer el file_id del mensaje reenviado
+        let fileId = null;
+        if (forwardedMsg.document) {
+            fileId = forwardedMsg.document.file_id;
+        } else if (forwardedMsg.video) {
+            fileId = forwardedMsg.video.file_id;
+        } else if (forwardedMsg.photo) {
+            // La foto es un array, tomamos la última (más grande)
+            fileId = forwardedMsg.photo[forwardedMsg.photo.length - 1].file_id;
+        }
+
+        if (!fileId) throw new Error("No se encontró file_id en el mensaje reenviado.");
+
+        // 3. Borrar el mensaje reenviado (limpieza)
+        const deleteUrl = `https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`;
+        await fetch(deleteUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: channelIdStr,
+                message_id: forwardedMsg.message_id
+            })
+        });
+
+        return fileId;
+
+    } catch (err) {
+        console.error("Fallo al obtener file_id vía Bot API:", err);
+        throw err; // Re-lanzar para manejar en server.js
     }
-    
-    return telegramUtils.getFileIdForStore(fileId);
 }
 
 // --- FUNCIONES DE EXPORTACIÓN ---
@@ -81,14 +104,17 @@ async function getTelegramFileId(messageResult) {
 export async function uploadToTelegram(file) {
   try {
     await initClient(); 
+    // Subir como documento para preservar calidad y evitar compresión
     const messageResult = await client.sendFile(chatId, { 
         file: file.path, 
         caption: "SnapCloud upload", 
         forceDocument: true 
     });
-    console.log("Archivo GRANDE subido. ID de Mensaje:", messageResult.id);
+    console.log("Archivo GRANDE subido. ID MTProto:", messageResult.id);
 
-    const fileId = await getTelegramFileId(messageResult);
+    // Obtener el ID compatible con Bot API
+    const fileId = await getTelegramFileId(messageResult.id, chatId);
+    
     return { 
         telegram_id: fileId,
         message_id: messageResult.id 
@@ -107,9 +133,11 @@ export async function uploadThumbnail(thumbPath) {
         caption: "SnapCloud thumbnail",
         forceDocument: false 
     });
-    console.log("Miniatura subida. ID de Mensaje:", messageResult.id);
+    console.log("Miniatura subida. ID MTProto:", messageResult.id);
 
-    const fileId = await getTelegramFileId(messageResult);
+    // Obtener el ID compatible con Bot API
+    const fileId = await getTelegramFileId(messageResult.id, botChatId);
+    
     return { 
         telegram_id: fileId,
         message_id: messageResult.id 
@@ -121,7 +149,7 @@ export async function uploadThumbnail(thumbPath) {
 }
 
 export async function getFileUrl(fileId) {
-    if (!BOT_TOKEN) throw new Error("BOT_TOKEN no configurado para getFileUrl.");
+    if (!BOT_TOKEN) throw new Error("BOT_TOKEN no configurado.");
     
     try {
         const url = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
@@ -129,17 +157,16 @@ export async function getFileUrl(fileId) {
         const dataPath = await responsePath.json();
         
         if (!dataPath.ok) {
-            const errorMessage = dataPath.description || "Respuesta de Telegram no fue OK y no contenía descripción del error.";
-            console.error(`ERROR CRÍTICO al obtener file path para ID ${fileId}: Fallo de Telegram: ${errorMessage}`);
-            throw new Error(`Fallo de Telegram: ${errorMessage}`);
+            const errorMessage = dataPath.description || "Error desconocido de Telegram.";
+            console.error(`ERROR CRÍTICO getFile: ${errorMessage}`);
+            throw new Error(`Telegram API Error: ${errorMessage}`);
         }
 
         const filePath = dataPath.result.file_path;
-        const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
-        return fileUrl;
+        return `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
 
     } catch (error) {
-        console.error("Error en getFileUrl (Catch General):", error.message);
+        console.error("Error en getFileUrl:", error.message);
         throw error;
     }
 }
