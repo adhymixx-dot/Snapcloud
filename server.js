@@ -5,13 +5,12 @@ import fs from "fs";
 import path from "path";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-// Importar funciones de uploader.js
+// Importar funciones de uploader.js (Deben ser 3 funciones)
 import { uploadToTelegram, uploadThumbnail, getFileUrl } from "./uploader.js"; 
 // Importar funciones de thumbnailer.js
 import { generateThumbnail, cleanupThumbnail } from "./thumbnailer.js"; 
 
 const app = express();
-// Permitir CORS para tu frontend
 app.use(cors({ origin: "https://snapcloud.netlify.app" })); 
 app.use(express.json());
 
@@ -49,7 +48,7 @@ function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-// ⚠️ FUNCIÓN AUXILIAR CRUCIAL: Extraer el file_id del objeto de respuesta de GramJS
+// 🔑 FUNCIÓN DE EXTRACCIÓN DE ID (CORREGIDA)
 function extractFileId(messageResult) {
     if (!messageResult || !messageResult.media) {
         console.error("Error al extraer ID: messageResult o media es nulo/indefinido.", messageResult);
@@ -58,24 +57,20 @@ function extractFileId(messageResult) {
 
     let fileId = null;
 
-    if (messageResult.media.photo) {
-        // Para fotos/miniaturas: usamos el 'id' del último PhotoSize (el de mejor calidad).
-        const sizes = messageResult.media.photo.sizes;
-        if (sizes && sizes.length > 0) {
-            const largestSize = sizes[sizes.length - 1];
-            fileId = largestSize.id; 
-        }
-    } else if (messageResult.media.document) {
+    if (messageResult.media.photo && messageResult.media.photo.id) {
+        // Para fotos/miniaturas: Usamos el ID del objeto Photo principal.
+        fileId = messageResult.media.photo.id;
+    } else if (messageResult.media.document && messageResult.media.document.id) {
         // Para documentos/archivos grandes
         fileId = messageResult.media.document.id;
-    } else if (messageResult.media.video) {
+    } else if (messageResult.media.video && messageResult.media.video.id) {
         // Para videos
         fileId = messageResult.media.video.id;
     }
 
     // CLAVE: Convertir el objeto Integer/BigInt de GramJS a string.
     if (fileId) {
-        // Si tiene una propiedad 'value' (objeto GramJS.Integer), la usamos. Si no, usamos el valor directo.
+        // Si tiene una propiedad 'value' (objeto GramJS.Integer), la usamos.
         const idValue = fileId.value ? fileId.value : fileId; 
         return idValue.toString();
     }
@@ -99,37 +94,30 @@ function authMiddleware(req, res, next) {
   }
 }
 
-// --- RUTAS DE AUTENTICACIÓN ---
-
-// Registro
+// Registro/Login (Omitido por brevedad, asumimos que están correctos)
 app.post("/register", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email y password son requeridos" });
-
   const users = readJSON(USERS_FILE);
   if (users.find(u => u.email === email)) return res.status(400).json({ error: "Usuario ya existe" });
-
   const hash = await bcrypt.hash(password, 10);
   const newUser = { id: Date.now(), email, password: hash };
   users.push(newUser);
   writeJSON(USERS_FILE, users);
-
   res.json({ ok: true, message: "Usuario registrado" });
 });
 
-// Login
 app.post("/login", async (req, res) => {
   const { email, password } = req.body;
   const users = readJSON(USERS_FILE);
   const user = users.find(u => u.email === email);
   if (!user) return res.status(400).json({ error: "Usuario no encontrado" });
-
   const match = await bcrypt.compare(password, user.password);
   if (!match) return res.status(400).json({ error: "Password incorrecto" });
-
   const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
   res.json({ ok: true, token });
 });
+
 
 // 🚀 RUTA CRUCIAL DE SUBIDA 🚀
 app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
@@ -141,16 +129,15 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
     // PASO 1: Generar la miniatura
     thumbPath = await generateThumbnail(req.file);
 
-    // PASO 2: Subir la miniatura con el CLIENTE/USUARIO al canal del BOT
+    // PASO 2: Subir la miniatura y obtener su ID.
     const thumbnailResult = await uploadThumbnail(thumbPath); 
     const thumbnailId = extractFileId(thumbnailResult); 
-    // Si la corrección de ID falla, lanzamos un error que veremos en Render logs.
-    if (!thumbnailId) throw new Error("No se pudo obtener el ID del archivo de la miniatura. La respuesta de Telegram no contiene la entidad multimedia esperada.");
+    if (!thumbnailId) throw new Error("No se pudo obtener el ID del archivo de la miniatura (Foto). La respuesta de Telegram no contiene la entidad multimedia esperada.");
 
-    // PASO 3: Subir el archivo original con el CLIENTE/USUARIO al canal del USUARIO
+    // 🚀 PASO 3: Subir el archivo original al canal del usuario (si la miniatura funcionó)
     const originalResult = await uploadToTelegram(req.file);
     const originalId = extractFileId(originalResult);
-    if (!originalId) throw new Error("No se pudo obtener el ID del archivo original. La respuesta de Telegram no contiene la entidad multimedia esperada.");
+    if (!originalId) throw new Error("No se pudo obtener el ID del archivo original (Documento/Video). Posiblemente falló la subida grande.");
 
     // PASO 4: Guardar metadata y limpiar
     const files = readJSON(FILES_FILE);
@@ -179,19 +166,16 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   }
 });
 
-// --- RUTAS DE VISUALIZACIÓN ---
-
-// 1. Listar archivos del usuario
+// Listar archivos del usuario
 app.get("/files", authMiddleware, (req, res) => {
   const files = readJSON(FILES_FILE).filter(f => f.user_id === req.user.id);
   res.json(files);
 });
 
-// 2. Ruta CRUCIAL: Obtener URL de la CDN de Telegram
+// Ruta CRUCIAL: Obtener URL de la CDN de Telegram
 app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     try {
         const fileId = req.params.file_id;
-        // getFileUrl usa el BOT_TOKEN para obtener la URL
         const url = await getFileUrl(fileId); 
         res.json({ url });
     } catch (error) {

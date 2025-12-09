@@ -6,17 +6,18 @@ import fs from "fs";
 function getRequiredBigInt(varName) {
     const value = process.env[varName];
     if (!value) {
-        throw new Error(`CRITICAL ERROR: Environment variable ${varName} is missing or empty. The server cannot start.`);
+        throw new Error(`ERROR CRÍTICO: La variable de entorno ${varName} no está configurada.`);
     }
+    // Asegura que BigInt se usa para los IDs
     return BigInt(value);
 }
 
-// --- CONFIGURACIÓN DEL CLIENTE ÚNICO (USUARIO: Archivos Grandes Y Miniaturas) ---
+// --- CONFIGURACIÓN DEL CLIENTE ÚNICO (USUARIO) ---
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
-// ID del Canal principal donde sube el usuario (para archivos grandes)
+// ID del Canal principal (para archivos grandes)
 const chatId = getRequiredBigInt("TELEGRAM_CHANNEL_ID"); 
-// ID del Canal donde sube el bot las miniaturas (para las miniaturas)
+// ID del Canal donde sube el bot las miniaturas
 const botChatId = getRequiredBigInt("BOT_CHANNEL_ID"); 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
@@ -38,9 +39,16 @@ async function initClient() {
  */
 export async function uploadToTelegram(file) {
   try {
-    await initClient(); // Inicializa el cliente de usuario
-    const result = await client.sendFile(chatId, { file: file.path, caption: "SnapCloud upload" });
+    await initClient(); 
+    // Usamos forceDocument: true para forzar que los archivos se suban como documentos, 
+    // asegurando que se suba el archivo completo.
+    const result = await client.sendFile(chatId, { 
+        file: file.path, 
+        caption: "SnapCloud upload", 
+        forceDocument: true 
+    });
     console.log("Archivo GRANDE subido por USUARIO:", result.id || result);
+    // OJO: La limpieza del archivo local la hace server.js, no la hagas aquí o fallará si hay un error.
     return result;
   } catch (err) {
     console.error("Error subiendo archivo GRANDE a Telegram:", err);
@@ -50,15 +58,14 @@ export async function uploadToTelegram(file) {
 
 /**
  * 🖼️ Sube la miniatura al canal del bot (USA EL CLIENTE/USUARIO).
- * Nota: Tu usuario sube la miniatura al canal del bot (BOT_CHANNEL_ID).
  */
 export async function uploadThumbnail(thumbPath) {
   try {
-    await initClient(); // Inicializa el cliente de usuario
+    await initClient(); 
     const result = await client.sendFile(botChatId, { 
         file: thumbPath, 
         caption: "SnapCloud thumbnail",
-        forceDocument: false
+        forceDocument: false // Permitir que se suba como foto
     });
     console.log("Miniatura subida por USUARIO a canal de Bot:", result.id || result);
     return result;
@@ -74,7 +81,6 @@ export async function uploadThumbnail(thumbPath) {
 export async function getFileUrl(fileId) {
     if (!BOT_TOKEN) throw new Error("BOT_TOKEN no configurado para getFileUrl.");
     
-    // Esta función usa el BOT_TOKEN a través de la API HTTP REST.
     try {
         const responsePath = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`);
         const dataPath = await responsePath.json();
