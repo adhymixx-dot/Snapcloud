@@ -50,7 +50,6 @@ function writeJSON(file, data) {
 }
 
 // ⚠️ FUNCIÓN AUXILIAR CRUCIAL: Extraer el file_id del objeto de respuesta de GramJS
-// FIX: Maneja el objeto Integer de GramJS para extraer el ID de archivo.
 function extractFileId(messageResult) {
     if (!messageResult || !messageResult.media) {
         console.error("Error al extraer ID: messageResult o media es nulo/indefinido.", messageResult);
@@ -60,25 +59,25 @@ function extractFileId(messageResult) {
     let fileId = null;
 
     if (messageResult.media.photo) {
-        // Para fotos, el ID de archivo real para la API HTTP es el 'id' del último PhotoSize (el más grande/mejor calidad).
+        // Para fotos/miniaturas: siempre usamos el 'id' del último PhotoSize (el de mejor calidad).
         const sizes = messageResult.media.photo.sizes;
         if (sizes && sizes.length > 0) {
-            // El ID de archivo de Telegram para la API HTTP es el campo 'id' dentro de PhotoSize.
             const largestSize = sizes[sizes.length - 1];
+            // Aseguramos que 'id' exista en el objeto largestSize
             fileId = largestSize.id; 
         }
     } else if (messageResult.media.document) {
-        // Para documentos, el ID es el del documento.
+        // Para documentos/archivos grandes
         fileId = messageResult.media.document.id;
     } else if (messageResult.media.video) {
-        // Para videos, el ID es el del video.
+        // Para videos
         fileId = messageResult.media.video.id;
     }
 
-    // El fileId es un objeto Integer o BigInt. Debemos convertirlo a string.
+    // CLAVE: Convertir el objeto Integer/BigInt de GramJS a string.
     if (fileId) {
-        // Si es un objeto GramJS 'Integer', su valor está en .value. Si es un BigInt nativo, lo toma directo.
-        const idValue = fileId.value || fileId;
+        // Si tiene una propiedad 'value' (objeto GramJS.Integer), la usamos. Si no, usamos el valor directo.
+        const idValue = fileId.value ? fileId.value : fileId; 
         return idValue.toString();
     }
     
