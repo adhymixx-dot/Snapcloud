@@ -5,7 +5,7 @@ import fs from "fs";
 import path from "path";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-// IMPORTANTE: Asegúrate de que tu uploader.js exporte estas 3 funciones
+// Importar funciones de uploader.js
 import { uploadToTelegram, uploadThumbnail, getFileUrl } from "./uploader.js"; 
 // Importar funciones de thumbnailer.js
 import { generateThumbnail, cleanupThumbnail } from "./thumbnailer.js"; 
@@ -15,7 +15,7 @@ const app = express();
 app.use(cors({ origin: "https://snapcloud.netlify.app" })); 
 app.use(express.json());
 
-// Carpeta para uploads temporales (se limpiará inmediatamente)
+// Carpeta para uploads temporales
 const uploadDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
@@ -59,7 +59,7 @@ function extractFileId(messageResult) {
     let fileId = null;
 
     if (messageResult.media.photo) {
-        // Para fotos/miniaturas: siempre usamos el 'id' del último PhotoSize (el de mejor calidad).
+        // Para fotos/miniaturas: usamos el 'id' del último PhotoSize (el de mejor calidad).
         const sizes = messageResult.media.photo.sizes;
         if (sizes && sizes.length > 0) {
             const largestSize = sizes[sizes.length - 1];
@@ -143,14 +143,12 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
 
     // PASO 2: Subir la miniatura con el CLIENTE/USUARIO al canal del BOT
     const thumbnailResult = await uploadThumbnail(thumbPath); 
-    // ⚠️ Obtener el ID de ARCHIVO real para la CDN
     const thumbnailId = extractFileId(thumbnailResult); 
+    // Si la corrección de ID falla, lanzamos un error que veremos en Render logs.
     if (!thumbnailId) throw new Error("No se pudo obtener el ID del archivo de la miniatura. La respuesta de Telegram no contiene la entidad multimedia esperada.");
 
-    // ⛔ PASO 3: Subir el archivo original con el CLIENTE/USUARIO al canal del USUARIO
-    // Si la subida grande está fallando, el error ocurre aquí.
+    // PASO 3: Subir el archivo original con el CLIENTE/USUARIO al canal del USUARIO
     const originalResult = await uploadToTelegram(req.file);
-    // ⚠️ Obtener el ID de ARCHIVO real para la CDN
     const originalId = extractFileId(originalResult);
     if (!originalId) throw new Error("No se pudo obtener el ID del archivo original. La respuesta de Telegram no contiene la entidad multimedia esperada.");
 
