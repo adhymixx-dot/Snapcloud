@@ -5,22 +5,18 @@ import fs from "fs";
 import path from "path";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-// Importar funciones de uploader.js (incluyendo la nueva getFileUrl)
+// Importar funciones de uploader.js
 import { uploadToTelegram, uploadThumbnail, getFileUrl } from "./uploader.js"; 
 // Importar funciones de thumbnailer.js
 import { generateThumbnail, cleanupThumbnail } from "./thumbnailer.js"; 
 
 const app = express();
-// Permitir CORS para tu frontend
 app.use(cors({ origin: "https://snapcloud.netlify.app" })); 
 app.use(express.json());
 
-// Carpeta para uploads temporales (se limpiará inmediatamente)
+// Carpeta para uploads temporales
 const uploadDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-
-// ⚠️ NOTA: Ya no serviremos archivos estáticos desde /uploads 
-// porque los archivos se eliminan después de la subida a Telegram.
 
 // Configuración multer
 const upload = multer({
@@ -45,6 +41,26 @@ function readJSON(file) {
 }
 function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+// ⚠️ FUNCIÓN AUXILIAR CRUCIAL: Extraer el file_id del objeto de respuesta de GramJS
+function extractFileId(messageResult) {
+    if (!messageResult || !messageResult.media) return null;
+
+    let media = null;
+    if (messageResult.media.photo) {
+        // Para fotos/miniaturas, el file_id es el más grande disponible (la miniatura en sí)
+        const sizes = messageResult.media.photo.sizes;
+        // Obtenemos el ID de la foto con mejor calidad (el último elemento del array sizes)
+        media = sizes[sizes.length - 1]; 
+    } else if (messageResult.media.document) {
+        media = messageResult.media.document;
+    } else if (messageResult.media.video) {
+        media = messageResult.media.video;
+    }
+
+    // El ID real es el 'id' de la entidad multimedia, no el ID del mensaje
+    return media?.id.toString() || null;
 }
 
 // Middleware de autenticación
@@ -93,7 +109,7 @@ app.post("/login", async (req, res) => {
   res.json({ ok: true, token });
 });
 
-// --- RUTA DE SUBIDA (Modificada) ---
+// --- RUTA DE SUBIDA (Modificada para usar extractFileId) ---
 
 app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   let thumbPath = null;
@@ -101,27 +117,30 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file provided" });
 
-    // PASO 1: Generar la miniatura (temporalmente en el disco)
+    // PASO 1: Generar la miniatura
     thumbPath = await generateThumbnail(req.file);
 
     // PASO 2: Subir la miniatura con el CLIENTE al canal del BOT
-    // NOTA: Telegram devuelve un objeto completo, usamos el ID del mensaje como referencia.
     const thumbnailResult = await uploadThumbnail(thumbPath); 
-    const thumbnailId = thumbnailResult.id || thumbnailResult; // Guardamos el ID del mensaje o el objeto
+    // ⚠️ Obtener el ID de ARCHIVO real
+    const thumbnailId = extractFileId(thumbnailResult); 
+    if (!thumbnailId) throw new Error("No se pudo obtener el ID del archivo de la miniatura. ¿Es una foto válida?");
 
     // PASO 3: Subir el archivo original con el CLIENTE al canal del USUARIO
     const originalResult = await uploadToTelegram(req.file);
-    const originalId = originalResult.id || originalResult;
+    // ⚠️ Obtener el ID de ARCHIVO real
+    const originalId = extractFileId(originalResult);
+    if (!originalId) throw new Error("No se pudo obtener el ID del archivo original.");
 
     // PASO 4: Guardar metadata y limpiar
     const files = readJSON(FILES_FILE);
     files.push({
-      id: Date.now(), // Un ID para el archivo
+      id: Date.now(),
       user_id: req.user.id,
       name: req.file.originalname,
       mime: req.file.mimetype,
-      thumbnail_id: thumbnailId,   // ID del mensaje/objeto para la miniatura
-      telegram_id: originalId,     // ID del mensaje/objeto para el archivo original
+      thumbnail_id: thumbnailId,   // ¡Ahora es el ID de archivo correcto!
+      telegram_id: originalId,     // ¡Ahora es el ID de archivo correcto!
       created_at: new Date()
     });
     writeJSON(FILES_FILE, files);
@@ -140,7 +159,7 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   }
 });
 
-// --- RUTAS DE VISUALIZACIÓN (Nuevas) ---
+// --- RUTAS DE VISUALIZACIÓN ---
 
 // 1. Listar archivos del usuario
 app.get("/files", authMiddleware, (req, res) => {
@@ -152,9 +171,11 @@ app.get("/files", authMiddleware, (req, res) => {
 app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     try {
         const fileId = req.params.file_id;
-        const url = await getFileUrl(fileId);
+        // getFileUrl usa el BOT_TOKEN para obtener la URL
+        const url = await getFileUrl(fileId); 
         res.json({ url });
     } catch (error) {
+        console.error("Error en /file-url:", error.message);
         res.status(500).json({ error: error.message || "Error al obtener la URL del archivo de Telegram" });
     }
 });
