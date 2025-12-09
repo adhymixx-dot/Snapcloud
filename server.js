@@ -5,18 +5,22 @@ import fs from "fs";
 import path from "path";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-import { uploadToTelegram } from "./uploader.js";
+// Importar funciones de uploader.js (incluyendo la nueva getFileUrl)
+import { uploadToTelegram, uploadThumbnail, getFileUrl } from "./uploader.js"; 
+// Importar funciones de thumbnailer.js
+import { generateThumbnail, cleanupThumbnail } from "./thumbnailer.js"; 
 
 const app = express();
-app.use(cors({ origin: "https://snapcloud.netlify.app" })); // ajusta tu frontend
+// Permitir CORS para tu frontend
+app.use(cors({ origin: "https://snapcloud.netlify.app" })); 
 app.use(express.json());
 
-// Carpeta para uploads permanentes
+// Carpeta para uploads temporales (se limpiará inmediatamente)
 const uploadDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
-// Servir archivos estáticos
-app.use("/uploads", express.static(uploadDir));
+// ⚠️ NOTA: Ya no serviremos archivos estáticos desde /uploads 
+// porque los archivos se eliminan después de la subida a Telegram.
 
 // Configuración multer
 const upload = multer({
@@ -57,6 +61,8 @@ function authMiddleware(req, res, next) {
   }
 }
 
+// --- RUTAS DE AUTENTICACIÓN (Sin Cambios) ---
+
 // Registro
 app.post("/register", async (req, res) => {
   const { email, password } = req.body;
@@ -87,37 +93,70 @@ app.post("/login", async (req, res) => {
   res.json({ ok: true, token });
 });
 
-// Subir archivo
+// --- RUTA DE SUBIDA (Modificada) ---
+
 app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
+  let thumbPath = null;
+  
   try {
     if (!req.file) return res.status(400).json({ error: "No file provided" });
 
-    // Subir a Telegram
-    const result = await uploadToTelegram(req.file);
+    // PASO 1: Generar la miniatura (temporalmente en el disco)
+    thumbPath = await generateThumbnail(req.file);
 
-    // Guardar metadata incluyendo filename para mostrar miniaturas
+    // PASO 2: Subir la miniatura con el CLIENTE al canal del BOT
+    // NOTA: Telegram devuelve un objeto completo, usamos el ID del mensaje como referencia.
+    const thumbnailResult = await uploadThumbnail(thumbPath); 
+    const thumbnailId = thumbnailResult.id || thumbnailResult; // Guardamos el ID del mensaje o el objeto
+
+    // PASO 3: Subir el archivo original con el CLIENTE al canal del USUARIO
+    const originalResult = await uploadToTelegram(req.file);
+    const originalId = originalResult.id || originalResult;
+
+    // PASO 4: Guardar metadata y limpiar
     const files = readJSON(FILES_FILE);
     files.push({
+      id: Date.now(), // Un ID para el archivo
       user_id: req.user.id,
       name: req.file.originalname,
-      filename: req.file.filename, // nombre guardado en uploads/
-      telegram_id: result.id || result,
+      mime: req.file.mimetype,
+      thumbnail_id: thumbnailId,   // ID del mensaje/objeto para la miniatura
+      telegram_id: originalId,     // ID del mensaje/objeto para el archivo original
       created_at: new Date()
     });
     writeJSON(FILES_FILE, files);
+    
+    // Limpiar archivos locales
+    fs.unlinkSync(req.file.path);
+    cleanupThumbnail(thumbPath);
 
-    res.json({ ok: true, fileId: result.id || result, message: "Archivo subido correctamente" });
+    res.json({ ok: true, fileId: originalId, thumbnailId: thumbnailId, message: "Archivo subido correctamente" });
   } catch (err) {
     console.error("Error en /upload:", err);
+    // Asegurar limpieza en caso de error
     if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    if (thumbPath) cleanupThumbnail(thumbPath);
     res.status(500).json({ error: err.message || "Error subiendo archivo" });
   }
 });
 
-// Listar archivos del usuario
+// --- RUTAS DE VISUALIZACIÓN (Nuevas) ---
+
+// 1. Listar archivos del usuario
 app.get("/files", authMiddleware, (req, res) => {
   const files = readJSON(FILES_FILE).filter(f => f.user_id === req.user.id);
   res.json(files);
+});
+
+// 2. Ruta CRUCIAL: Obtener URL de la CDN de Telegram
+app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
+    try {
+        const fileId = req.params.file_id;
+        const url = await getFileUrl(fileId);
+        res.json({ url });
+    } catch (error) {
+        res.status(500).json({ error: error.message || "Error al obtener la URL del archivo de Telegram" });
+    }
 });
 
 // Servidor
