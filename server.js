@@ -5,181 +5,78 @@ import fs from "fs";
 import path from "path";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-import { TelegramClient } from "telegram";
-import { StringSession } from "telegram/sessions/index.js";
-import sharp from "sharp";
-import ffmpeg from "fluent-ffmpeg";
+import { uploadToTelegram } from "./uploader.js";
 
 const app = express();
-
-app.use(cors({
-  origin: "https://snapcloud.netlify.app",
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
+app.use(cors());
 app.use(express.json());
 
-// Carpeta temporal
 const uploadDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: uploadDir,
-    filename: (req, file, cb) => cb(null, Date.now() + "_" + file.originalname)
-  }),
-  limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
-});
+const upload = multer({ storage: multer.diskStorage({ destination: uploadDir, filename: (req, file, cb)=> cb(null, Date.now()+"_"+file.originalname) }) });
 
-// Archivos JSON
 const USERS_FILE = path.join(process.cwd(), "users.json");
 const FILES_FILE = path.join(process.cwd(), "files.json");
-
-// JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || "clave_super_secreta";
 
-// Telegram
-const apiId = Number(process.env.TELEGRAM_API_ID);
-const apiHash = process.env.TELEGRAM_API_HASH;
-const botChannelId = BigInt(process.env.TELEGRAM_BOT_CHANNEL);
-const userChannelId = BigInt(process.env.TELEGRAM_USER_CHANNEL);
-const session = new StringSession(process.env.TELEGRAM_SESSION);
-const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
+function readJSON(file){ if(!fs.existsSync(file)) return []; return JSON.parse(fs.readFileSync(file)); }
+function writeJSON(file,data){ fs.writeFileSync(file, JSON.stringify(data,null,2)); }
 
-let started = false;
-async function initTelegram() {
-  if (started) return;
-  await client.connect();
-  started = true;
-  console.log("Telegram conectado.");
-}
-
-// Funciones JSON
-function readJSON(file) { if (!fs.existsSync(file)) return []; return JSON.parse(fs.readFileSync(file)); }
-function writeJSON(file, data) { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
-
-// Middleware de autenticación
-function authMiddleware(req, res, next) {
+function authMiddleware(req,res,next){
   const token = req.headers["authorization"]?.split("Bearer ")[1];
-  if (!token) return res.status(401).json({ error: "No autorizado" });
-  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
-  catch { return res.status(401).json({ error: "Token inválido" }); }
+  if(!token) return res.status(401).json({error:"No autorizado"});
+  try{ req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch{ return res.status(401).json({error:"Token inválido"}); }
 }
 
 // Registro
-app.post("/register", async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: "Email y password son requeridos" });
-
+app.post("/register", async (req,res)=>{
+  const { email,password } = req.body;
+  if(!email||!password) return res.status(400).json({error:"Email y password requeridos"});
   const users = readJSON(USERS_FILE);
-  if (users.find(u => u.email === email)) return res.status(400).json({ error: "Usuario ya existe" });
-
-  const hash = await bcrypt.hash(password, 10);
-  users.push({ id: Date.now(), email, password: hash });
-  writeJSON(USERS_FILE, users);
-  res.json({ ok: true, message: "Usuario registrado" });
+  if(users.find(u=>u.email===email)) return res.status(400).json({error:"Usuario ya existe"});
+  const hash = await bcrypt.hash(password,10);
+  users.push({id:Date.now(),email,password:hash});
+  writeJSON(USERS_FILE,users);
+  res.json({ok:true});
 });
 
 // Login
-app.post("/login", async (req, res) => {
-  const { email, password } = req.body;
+app.post("/login", async (req,res)=>{
+  const { email,password } = req.body;
   const users = readJSON(USERS_FILE);
-  const user = users.find(u => u.email === email);
-  if (!user) return res.status(400).json({ error: "Usuario no encontrado" });
-
-  const match = await bcrypt.compare(password, user.password);
-  if (!match) return res.status(400).json({ error: "Password incorrecto" });
-
-  const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
-  res.json({ ok: true, token });
+  const user = users.find(u=>u.email===email);
+  if(!user) return res.status(400).json({error:"Usuario no encontrado"});
+  const match = await bcrypt.compare(password,user.password);
+  if(!match) return res.status(400).json({error:"Password incorrecto"});
+  const token = jwt.sign({id:user.id,email:user.email},JWT_SECRET,{expiresIn:"7d"});
+  res.json({ok:true,token});
 });
 
-// Generar miniatura
-function generateThumbnail(filePath, type) {
-  return new Promise((resolve, reject) => {
-    const thumbPath = filePath + "_thumb.jpg";
-    if (type === "image") {
-      sharp(filePath).resize(200, 200, { fit: "cover" })
-        .toFile(thumbPath).then(() => resolve(thumbPath)).catch(reject);
-    } else if (type === "video") {
-      ffmpeg(filePath)
-        .screenshots({ count: 1, folder: path.dirname(filePath), filename: path.basename(thumbPath), size: "200x200" })
-        .on("end", () => resolve(thumbPath))
-        .on("error", reject);
-    } else reject(new Error("Tipo desconocido"));
-  });
-}
-
 // Subir archivo
-app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "No file provided" });
-    await initTelegram();
-    const type = req.file.mimetype.startsWith("video") ? "video" : "image";
-
-    const thumbPath = await generateThumbnail(req.file.path, type);
-
-    const resultOriginal = await client.sendFile(userChannelId, { file: req.file.path, caption: "Archivo SnapCloud" });
-    const resultThumb = await client.sendFile(botChannelId, { file: thumbPath, caption: "Miniatura" });
-
-    fs.unlinkSync(req.file.path);
-    fs.unlinkSync(thumbPath);
-
+app.post("/upload", authMiddleware, upload.single("file"), async (req,res)=>{
+  if(!req.file) return res.status(400).json({error:"No file"});
+  try{
+    const result = await uploadToTelegram(req.file);
     const files = readJSON(FILES_FILE);
     files.push({
       user_id: req.user.id,
       name: req.file.originalname,
-      fileId: resultOriginal.id,
-      thumbId: resultThumb.id,
-      type,
+      type: req.file.mimetype.startsWith("image/")?"image":"video",
+      fileId: result.originalId,
+      thumbId: result.thumbId,
       created_at: new Date()
     });
-    writeJSON(FILES_FILE, files);
-
-    res.json({ ok: true, fileId: resultOriginal.id, thumbId: resultThumb.id });
-  } catch (err) {
-    console.error("Error en /upload:", err);
-    if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-    res.status(500).json({ error: err.message || "Error subiendo archivo" });
-  }
+    writeJSON(FILES_FILE,files);
+    res.json({ok:true});
+  }catch(err){ console.error(err); res.status(500).json({error:err.message}); }
 });
 
-// Listar archivos del usuario
-app.get("/files", authMiddleware, (req, res) => {
-  const files = readJSON(FILES_FILE).filter(f => f.user_id === req.user.id);
+// Obtener archivos
+app.get("/files", authMiddleware, (req,res)=>{
+  const files = readJSON(FILES_FILE).filter(f=>f.user_id===req.user.id);
   res.json(files);
 });
 
-// Servir miniaturas
-app.get("/thumbnail/:thumbId", authMiddleware, async (req, res) => {
-  const thumbId = BigInt(req.params.thumbId);
-  try {
-    await initTelegram();
-    const buffer = await client.downloadFile(thumbId, { asBuffer: true });
-    res.setHeader("Content-Type", "image/jpeg");
-    res.send(buffer);
-  } catch (err) {
-    console.error("Error miniatura:", err);
-    res.status(500).json({ error: "No se pudo obtener la miniatura" });
-  }
-});
-
-// Servir archivo completo
-app.get("/file/:fileId", authMiddleware, async (req, res) => {
-  const fileId = BigInt(req.params.fileId);
-  try {
-    await initTelegram();
-    const buffer = await client.downloadFile(fileId, { asBuffer: true });
-    const file = readJSON(FILES_FILE).find(f => f.fileId === fileId);
-    const mimeType = file?.type === "video" ? "video/mp4" : "image/jpeg";
-    res.setHeader("Content-Type", mimeType);
-    res.send(buffer);
-  } catch (err) {
-    console.error("Error archivo:", err);
-    res.status(500).json({ error: "No se pudo obtener el archivo" });
-  }
-});
-
-// Servidor
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor iniciado en puerto ${PORT}`));
+app.listen(process.env.PORT||3000, ()=>console.log("Servidor iniciado"));
