@@ -5,7 +5,7 @@ import fs from "fs";
 import path from "path";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-// Importar funciones de uploader.js (las que usan el cliente único)
+// IMPORTANTE: Asegúrate de que tu uploader.js exporte estas 3 funciones
 import { uploadToTelegram, uploadThumbnail, getFileUrl } from "./uploader.js"; 
 // Importar funciones de thumbnailer.js
 import { generateThumbnail, cleanupThumbnail } from "./thumbnailer.js"; 
@@ -63,7 +63,6 @@ function extractFileId(messageResult) {
         const sizes = messageResult.media.photo.sizes;
         if (sizes && sizes.length > 0) {
             const largestSize = sizes[sizes.length - 1];
-            // Aseguramos que 'id' exista en el objeto largestSize
             fileId = largestSize.id; 
         }
     } else if (messageResult.media.document) {
@@ -132,8 +131,7 @@ app.post("/login", async (req, res) => {
   res.json({ ok: true, token });
 });
 
-// --- RUTA DE SUBIDA ---
-
+// 🚀 RUTA CRUCIAL DE SUBIDA 🚀
 app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   let thumbPath = null;
   
@@ -149,7 +147,8 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
     const thumbnailId = extractFileId(thumbnailResult); 
     if (!thumbnailId) throw new Error("No se pudo obtener el ID del archivo de la miniatura. La respuesta de Telegram no contiene la entidad multimedia esperada.");
 
-    // PASO 3: Subir el archivo original con el CLIENTE/USUARIO al canal del USUARIO
+    // ⛔ PASO 3: Subir el archivo original con el CLIENTE/USUARIO al canal del USUARIO
+    // Si la subida grande está fallando, el error ocurre aquí.
     const originalResult = await uploadToTelegram(req.file);
     // ⚠️ Obtener el ID de ARCHIVO real para la CDN
     const originalId = extractFileId(originalResult);
