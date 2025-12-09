@@ -12,16 +12,14 @@ import ffmpeg from "fluent-ffmpeg";
 
 const app = express();
 
-// ---- CORS ----
 app.use(cors({
-  origin: "https://snapcloud.netlify.app", // tu frontend
+  origin: "https://snapcloud.netlify.app",
   methods: ["GET", "POST"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
-
 app.use(express.json());
 
-// ---- Carpeta temporal ----
+// Carpeta temporal
 const uploadDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
@@ -33,14 +31,14 @@ const upload = multer({
   limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
 });
 
-// ---- Archivos JSON ----
+// Archivos JSON
 const USERS_FILE = path.join(process.cwd(), "users.json");
 const FILES_FILE = path.join(process.cwd(), "files.json");
 
-// ---- JWT Secret ----
+// JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || "clave_super_secreta";
 
-// ---- Telegram ----
+// Telegram
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
 const botChannelId = BigInt(process.env.TELEGRAM_BOT_CHANNEL);
@@ -56,30 +54,19 @@ async function initTelegram() {
   console.log("Telegram conectado.");
 }
 
-// ---- Funciones JSON ----
-function readJSON(file) {
-  if (!fs.existsSync(file)) return [];
-  return JSON.parse(fs.readFileSync(file));
-}
+// Funciones JSON
+function readJSON(file) { if (!fs.existsSync(file)) return []; return JSON.parse(fs.readFileSync(file)); }
+function writeJSON(file, data) { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
 
-function writeJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
-
-// ---- Middleware de autenticación ----
+// Middleware de autenticación
 function authMiddleware(req, res, next) {
   const token = req.headers["authorization"]?.split("Bearer ")[1];
   if (!token) return res.status(401).json({ error: "No autorizado" });
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
-    next();
-  } catch {
-    return res.status(401).json({ error: "Token inválido" });
-  }
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch { return res.status(401).json({ error: "Token inválido" }); }
 }
 
-// ---- Registro ----
+// Registro
 app.post("/register", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email y password son requeridos" });
@@ -90,11 +77,10 @@ app.post("/register", async (req, res) => {
   const hash = await bcrypt.hash(password, 10);
   users.push({ id: Date.now(), email, password: hash });
   writeJSON(USERS_FILE, users);
-
   res.json({ ok: true, message: "Usuario registrado" });
 });
 
-// ---- Login ----
+// Login
 app.post("/login", async (req, res) => {
   const { email, password } = req.body;
   const users = readJSON(USERS_FILE);
@@ -108,51 +94,37 @@ app.post("/login", async (req, res) => {
   res.json({ ok: true, token });
 });
 
-// ---- Generar miniatura ----
+// Generar miniatura
 function generateThumbnail(filePath, type) {
   return new Promise((resolve, reject) => {
     const thumbPath = filePath + "_thumb.jpg";
     if (type === "image") {
-      sharp(filePath)
-        .resize(200, 200, { fit: "cover" })
-        .toFile(thumbPath)
-        .then(() => resolve(thumbPath))
-        .catch(reject);
+      sharp(filePath).resize(200, 200, { fit: "cover" })
+        .toFile(thumbPath).then(() => resolve(thumbPath)).catch(reject);
     } else if (type === "video") {
       ffmpeg(filePath)
-        .screenshots({
-          count: 1,
-          folder: path.dirname(filePath),
-          filename: path.basename(thumbPath),
-          size: "200x200"
-        })
+        .screenshots({ count: 1, folder: path.dirname(filePath), filename: path.basename(thumbPath), size: "200x200" })
         .on("end", () => resolve(thumbPath))
         .on("error", reject);
-    } else reject(new Error("Tipo desconocido para miniatura"));
+    } else reject(new Error("Tipo desconocido"));
   });
 }
 
-// ---- Subir archivo ----
+// Subir archivo
 app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file provided" });
-
     await initTelegram();
     const type = req.file.mimetype.startsWith("video") ? "video" : "image";
 
-    // Generar miniatura
     const thumbPath = await generateThumbnail(req.file.path, type);
 
-    // Subir archivo original al canal del usuario
     const resultOriginal = await client.sendFile(userChannelId, { file: req.file.path, caption: "Archivo SnapCloud" });
-
-    // Subir miniatura al canal del bot
     const resultThumb = await client.sendFile(botChannelId, { file: thumbPath, caption: "Miniatura" });
 
     fs.unlinkSync(req.file.path);
     fs.unlinkSync(thumbPath);
 
-    // Guardar metadata
     const files = readJSON(FILES_FILE);
     files.push({
       user_id: req.user.id,
@@ -172,21 +144,18 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   }
 });
 
-// ---- Listar archivos del usuario ----
+// Listar archivos del usuario
 app.get("/files", authMiddleware, (req, res) => {
   const files = readJSON(FILES_FILE).filter(f => f.user_id === req.user.id);
   res.json(files);
 });
 
-// ---- Servir miniaturas ----
+// Servir miniaturas
 app.get("/thumbnail/:thumbId", authMiddleware, async (req, res) => {
   const thumbId = BigInt(req.params.thumbId);
   try {
     await initTelegram();
-
-    // Descargar directamente como buffer
     const buffer = await client.downloadFile(thumbId, { asBuffer: true });
-
     res.setHeader("Content-Type", "image/jpeg");
     res.send(buffer);
   } catch (err) {
@@ -195,17 +164,14 @@ app.get("/thumbnail/:thumbId", authMiddleware, async (req, res) => {
   }
 });
 
-// ---- Servir archivo completo ----
+// Servir archivo completo
 app.get("/file/:fileId", authMiddleware, async (req, res) => {
   const fileId = BigInt(req.params.fileId);
   try {
     await initTelegram();
-
     const buffer = await client.downloadFile(fileId, { asBuffer: true });
-
     const file = readJSON(FILES_FILE).find(f => f.fileId === fileId);
     const mimeType = file?.type === "video" ? "video/mp4" : "image/jpeg";
-
     res.setHeader("Content-Type", mimeType);
     res.send(buffer);
   } catch (err) {
@@ -214,6 +180,6 @@ app.get("/file/:fileId", authMiddleware, async (req, res) => {
   }
 });
 
-// ---- Servidor ----
+// Servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor iniciado en puerto ${PORT}`));
