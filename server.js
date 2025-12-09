@@ -11,10 +11,11 @@ import { uploadToTelegram, uploadThumbnail, getFileUrl } from "./uploader.js";
 import { generateThumbnail, cleanupThumbnail } from "./thumbnailer.js"; 
 
 const app = express();
+// Permitir CORS para tu frontend
 app.use(cors({ origin: "https://snapcloud.netlify.app" })); 
 app.use(express.json());
 
-// Carpeta para uploads temporales
+// Carpeta para uploads temporales (se limpiará inmediatamente)
 const uploadDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
@@ -44,24 +45,42 @@ function writeJSON(file, data) {
 }
 
 // ⚠️ FUNCIÓN AUXILIAR CRUCIAL: Extraer el file_id del objeto de respuesta de GramJS
+// Esta función fue mejorada para evitar el error de 'undefined'
 function extractFileId(messageResult) {
-    if (!messageResult || !messageResult.media) return null;
-
-    let media = null;
-    if (messageResult.media.photo) {
-        // Para fotos/miniaturas, el file_id es el más grande disponible (la miniatura en sí)
-        const sizes = messageResult.media.photo.sizes;
-        // Obtenemos el ID de la foto con mejor calidad (el último elemento del array sizes)
-        media = sizes[sizes.length - 1]; 
-    } else if (messageResult.media.document) {
-        media = messageResult.media.document;
-    } else if (messageResult.media.video) {
-        media = messageResult.media.video;
+    if (!messageResult || !messageResult.media) {
+        // En este punto, si la subida fue exitosa, messageResult.media no debería ser nulo.
+        // Podría ser un error de la subida misma.
+        console.error("Error al extraer ID: messageResult o media es nulo/indefinido.", messageResult);
+        return null;
     }
 
-    // El ID real es el 'id' de la entidad multimedia, no el ID del mensaje
-    return media?.id.toString() || null;
+    let media = null;
+    let fileId = null;
+
+    if (messageResult.media.photo) {
+        // Para fotos/miniaturas, usamos el ID de la foto con mejor calidad (la última en el array sizes)
+        const sizes = messageResult.media.photo.sizes;
+        media = sizes[sizes.length - 1]; 
+        fileId = media?.id; // El ID de la foto es el 'id' del PhotoSize
+    } else if (messageResult.media.document) {
+        // Para documentos, el ID es el 'id' del Documento
+        media = messageResult.media.document;
+        fileId = media?.id;
+    } else if (messageResult.media.video) {
+        // Para videos, el ID es el 'id' del Video
+        media = messageResult.media.video;
+        fileId = media?.id;
+    }
+
+    // Si encontramos un ID, lo convertimos a string (ya que es un BigInt en GramJS)
+    if (fileId) {
+        return fileId.toString();
+    }
+    
+    console.warn("Media desconocida o ID de archivo no encontrado en el mensaje:", messageResult.media);
+    return null; 
 }
+
 
 // Middleware de autenticación
 function authMiddleware(req, res, next) {
@@ -109,7 +128,7 @@ app.post("/login", async (req, res) => {
   res.json({ ok: true, token });
 });
 
-// --- RUTA DE SUBIDA (Modificada para usar extractFileId) ---
+// --- RUTA DE SUBIDA ---
 
 app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   let thumbPath = null;
@@ -122,15 +141,15 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
 
     // PASO 2: Subir la miniatura con el CLIENTE al canal del BOT
     const thumbnailResult = await uploadThumbnail(thumbPath); 
-    // ⚠️ Obtener el ID de ARCHIVO real
+    // ⚠️ Obtener el ID de ARCHIVO real para la CDN
     const thumbnailId = extractFileId(thumbnailResult); 
-    if (!thumbnailId) throw new Error("No se pudo obtener el ID del archivo de la miniatura. ¿Es una foto válida?");
+    if (!thumbnailId) throw new Error("No se pudo obtener el ID del archivo de la miniatura. La respuesta de Telegram no contiene la entidad multimedia esperada.");
 
     // PASO 3: Subir el archivo original con el CLIENTE al canal del USUARIO
     const originalResult = await uploadToTelegram(req.file);
-    // ⚠️ Obtener el ID de ARCHIVO real
+    // ⚠️ Obtener el ID de ARCHIVO real para la CDN
     const originalId = extractFileId(originalResult);
-    if (!originalId) throw new Error("No se pudo obtener el ID del archivo original.");
+    if (!originalId) throw new Error("No se pudo obtener el ID del archivo original. La respuesta de Telegram no contiene la entidad multimedia esperada.");
 
     // PASO 4: Guardar metadata y limpiar
     const files = readJSON(FILES_FILE);
@@ -139,8 +158,8 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
       user_id: req.user.id,
       name: req.file.originalname,
       mime: req.file.mimetype,
-      thumbnail_id: thumbnailId,   // ¡Ahora es el ID de archivo correcto!
-      telegram_id: originalId,     // ¡Ahora es el ID de archivo correcto!
+      thumbnail_id: thumbnailId,   // ID de archivo (string)
+      telegram_id: originalId,     // ID de archivo (string)
       created_at: new Date()
     });
     writeJSON(FILES_FILE, files);
