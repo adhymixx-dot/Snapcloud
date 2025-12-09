@@ -1,12 +1,26 @@
+// uploader.js (Versión Robusta)
+
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import fs from "fs";
 import path from "path";
 
+// Función de seguridad para asegurar que las variables de canal existen
+function getRequiredBigInt(varName) {
+    const value = process.env[varName];
+    if (!value) {
+        // Lanza un error claro que se verá en la consola de Render
+        throw new Error(`CRITICAL ERROR: Environment variable ${varName} is missing or empty. The server cannot start.`);
+    }
+    // Devuelve el valor como BigInt
+    return BigInt(value);
+}
+
 // 1. Configuración del CLIENTE (Archivos Grandes)
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
-const chatId = BigInt(process.env.TELEGRAM_CHANNEL_ID); // Canal del usuario (archivos grandes)
+// Usa la función robusta para TELEGRAM_CHANNEL_ID
+const chatId = getRequiredBigInt("TELEGRAM_CHANNEL_ID"); 
 
 const session = new StringSession(process.env.TELEGRAM_SESSION);
 const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
@@ -20,7 +34,8 @@ async function initClient() {
 }
 
 // 2. Configuración del Canal de Bot (Miniaturas)
-const botChatId = BigInt(process.env.BOT_CHANNEL_ID); // Canal del bot (miniaturas)
+// Usa la función robusta para BOT_CHANNEL_ID
+const botChatId = getRequiredBigInt("BOT_CHANNEL_ID"); 
 
 // --- Funciones de Exportación ---
 
@@ -48,7 +63,7 @@ export async function uploadThumbnail(thumbPath) {
     const result = await client.sendFile(botChatId, { 
         file: thumbPath, 
         caption: "SnapCloud thumbnail",
-        forceDocument: false // Permitir que Telegram lo trate como foto/video si aplica
+        forceDocument: false
     });
     console.log("Miniatura subida:", result.id || result);
     return result;
@@ -58,9 +73,7 @@ export async function uploadThumbnail(thumbPath) {
   }
 }
 
-// Función para obtener la URL de un archivo desde Telegram (requiere el BOT_TOKEN)
-// NOTA: Usar el cliente es difícil para obtener la URL de descarga directa. 
-// Es mucho mejor usar la API HTTP de un Bot para esto.
+// Función para obtener la URL de un archivo desde Telegram
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
 export async function getFileUrl(fileId) {
