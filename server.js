@@ -11,7 +11,14 @@ import sharp from "sharp";
 import ffmpeg from "fluent-ffmpeg";
 
 const app = express();
-app.use(cors());
+
+// ---- CORS ----
+app.use(cors({
+  origin: "https://snapcloud.netlify.app", // tu frontend
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
 app.use(express.json());
 
 // ---- Carpeta temporal ----
@@ -176,10 +183,12 @@ app.get("/thumbnail/:thumbId", authMiddleware, async (req, res) => {
   const thumbId = BigInt(req.params.thumbId);
   try {
     await initTelegram();
-    const tempPath = path.join(uploadDir, `${thumbId}_thumb`);
-    await client.downloadFile(thumbId, tempPath);
-    res.type("image/jpeg");
-    res.sendFile(tempPath, () => { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); });
+
+    // Descargar directamente como buffer
+    const buffer = await client.downloadFile(thumbId, { asBuffer: true });
+
+    res.setHeader("Content-Type", "image/jpeg");
+    res.send(buffer);
   } catch (err) {
     console.error("Error miniatura:", err);
     res.status(500).json({ error: "No se pudo obtener la miniatura" });
@@ -191,16 +200,19 @@ app.get("/file/:fileId", authMiddleware, async (req, res) => {
   const fileId = BigInt(req.params.fileId);
   try {
     await initTelegram();
-    const tempPath = path.join(uploadDir, `${fileId}_file`);
-    await client.downloadFile(fileId, tempPath);
-    res.sendFile(tempPath, () => { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); });
+
+    const buffer = await client.downloadFile(fileId, { asBuffer: true });
+
+    const file = readJSON(FILES_FILE).find(f => f.fileId === fileId);
+    const mimeType = file?.type === "video" ? "video/mp4" : "image/jpeg";
+
+    res.setHeader("Content-Type", mimeType);
+    res.send(buffer);
   } catch (err) {
     console.error("Error archivo:", err);
     res.status(500).json({ error: "No se pudo obtener el archivo" });
   }
 });
-
-// ---- Cerrar sesión opcional (frontend) ----
 
 // ---- Servidor ----
 const PORT = process.env.PORT || 3000;
