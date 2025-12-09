@@ -46,18 +46,15 @@ async function getTelegramFileId(messageResult) {
          throw new Error("No se encontró Documento, Foto o Video en el objeto media.");
     }
     
-    // ✅ CORRECCIÓN: Filtrar tamaños no válidos y comparar por bytes.
+    // CORRECCIÓN del TypeError: asegurar que seleccionamos el tamaño correcto de la foto.
     if (messageResult.media.photo) {
-        // Filtramos para quedarnos solo con objetos de tamaño de foto que tienen la propiedad 'bytes'
         const validSizes = messageResult.media.photo.sizes.filter(s => s && s.bytes); 
         
         if (validSizes.length === 0) {
             throw new Error("No se encontraron tamaños válidos para la foto (miniatura).");
         }
         
-        // Reducimos para encontrar el tamaño con más bytes (el más grande)
         fileMedia = validSizes.reduce((prev, current) => {
-            // prev.bytes y current.bytes son BigInts y se pueden comparar directamente.
             return prev.bytes > current.bytes ? prev : current; 
         });
     }
@@ -69,15 +66,18 @@ async function getTelegramFileId(messageResult) {
         fileReference: fileMedia.fileReference || Buffer.from([]),
     });
     
-    // GramJS utility para codificar el ID al formato que necesita la API HTTP del Bot.
-    return client.session.get.telegram.utils.getFileIdForStore(fileId);
+    // ✅ CORRECCIÓN FINAL: Acceso seguro a la utilidad de codificación de ID.
+    const telegramUtils = client.session.get.telegram && client.session.get.telegram.utils;
+
+    if (!telegramUtils || typeof telegramUtils.getFileIdForStore !== 'function') {
+        throw new Error("CRÍTICO: No se pudo acceder a la utilidad interna de GramJS para codificar el ID de archivo. Intenta reiniciar el servicio.");
+    }
+    
+    return telegramUtils.getFileIdForStore(fileId);
 }
 
 // --- FUNCIONES DE EXPORTACIÓN ---
 
-/**
- * 🚀 Sube el archivo original y devuelve un objeto con el file_id correcto.
- */
 export async function uploadToTelegram(file) {
   try {
     await initClient(); 
@@ -99,9 +99,6 @@ export async function uploadToTelegram(file) {
   }
 }
 
-/**
- * 🖼️ Sube la miniatura y devuelve un objeto con el file_id correcto.
- */
 export async function uploadThumbnail(thumbPath) {
   try {
     await initClient(); 
@@ -123,9 +120,6 @@ export async function uploadThumbnail(thumbPath) {
   }
 }
 
-/**
- * 🔗 Obtiene la URL de descarga de la CDN de Telegram (USA LA API HTTP DEL BOT).
- */
 export async function getFileUrl(fileId) {
     if (!BOT_TOKEN) throw new Error("BOT_TOKEN no configurado para getFileUrl.");
     
