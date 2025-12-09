@@ -88,7 +88,7 @@ app.post("/login", async (req, res) => {
 });
 
 
-// 🚀 RUTA CRUCIAL DE SUBIDA (CORREGIDA) 🚀
+// 🚀 RUTA CRUCIAL DE SUBIDA 🚀
 app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   let thumbPath = null;
   
@@ -100,14 +100,12 @@ app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
 
     // PASO 2: Subir la miniatura y obtener su ID (largo y correcto).
     const thumbnailResult = await uploadThumbnail(thumbPath); 
-    // ✅ CLAVE: Usamos .telegram_id que devuelve el ID único para la API HTTP del Bot
     const thumbnailId = thumbnailResult.telegram_id; 
     
     if (!thumbnailId) throw new Error("No se pudo obtener el ID del archivo de la miniatura.");
 
     // 🚀 PASO 3: Subir el archivo original al canal del usuario
     const originalResult = await uploadToTelegram(req.file);
-    // ✅ CLAVE: Usamos .telegram_id que devuelve el ID único para la API HTTP del Bot
     const originalId = originalResult.telegram_id; 
 
     if (!originalId) throw new Error("No se pudo obtener el ID del archivo original.");

@@ -9,16 +9,13 @@ function getRequiredBigInt(varName) {
     if (!value) {
         throw new Error(`CRITICAL ERROR: Environment variable ${varName} is missing or empty.`);
     }
-    // Asegura que BigInt se usa para los IDs
     return BigInt(value);
 }
 
 // --- CONFIGURACIÓN DEL CLIENTE ÚNICO (USUARIO) ---
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
-// ID del Canal principal donde sube el usuario (para archivos grandes)
 const chatId = getRequiredBigInt("TELEGRAM_CHANNEL_ID"); 
-// ID del Canal donde sube el usuario las miniaturas
 const botChatId = getRequiredBigInt("BOT_CHANNEL_ID"); 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
@@ -35,10 +32,9 @@ async function initClient() {
 
 /**
  * 🔑 Función crucial: Extrae el ID de archivo global (file_id) para la API HTTP del Bot.
- * Esto requiere el objeto de mensaje completo de Telegram.
  */
 async function getTelegramFileId(messageResult) {
-    await initClient(); // Asegura que el cliente de usuario esté conectado
+    await initClient();
 
     if (!messageResult || !messageResult.media) {
         throw new Error("El resultado del mensaje de Telegram está incompleto para extraer el file_id.");
@@ -49,36 +45,42 @@ async function getTelegramFileId(messageResult) {
     if (!fileMedia) {
          throw new Error("No se encontró Documento, Foto o Video en el objeto media.");
     }
-
-    // Para fotos, necesitamos el "PhotoSize" más grande
+    
+    // ✅ CORRECCIÓN: Filtrar tamaños no válidos y comparar por bytes.
     if (messageResult.media.photo) {
-        fileMedia = messageResult.media.photo.sizes.reduce((prev, current) => {
-            return (prev.size.value || prev.size) > (current.size.value || current.size) ? prev : current;
+        // Filtramos para quedarnos solo con objetos de tamaño de foto que tienen la propiedad 'bytes'
+        const validSizes = messageResult.media.photo.sizes.filter(s => s && s.bytes); 
+        
+        if (validSizes.length === 0) {
+            throw new Error("No se encontraron tamaños válidos para la foto (miniatura).");
+        }
+        
+        // Reducimos para encontrar el tamaño con más bytes (el más grande)
+        fileMedia = validSizes.reduce((prev, current) => {
+            // prev.bytes y current.bytes son BigInts y se pueden comparar directamente.
+            return prev.bytes > current.bytes ? prev : current; 
         });
     }
 
-    // El ID de archivo que la API del Bot necesita se genera a partir de estos campos:
+    // Usamos el objeto fileMedia final (el documento, video o el tamaño de foto más grande)
     const fileId = new Api.InputFileLocation({
         id: fileMedia.id,
         accessHash: fileMedia.accessHash,
         fileReference: fileMedia.fileReference || Buffer.from([]),
-        // Aquí no necesitamos los demás campos porque es un archivo ya subido
     });
     
-    // Convertimos el InputFileLocation a un file_id codificado en Base64, 
-    // que es el formato que requiere la API HTTP del Bot (getFile).
+    // GramJS utility para codificar el ID al formato que necesita la API HTTP del Bot.
     return client.session.get.telegram.utils.getFileIdForStore(fileId);
 }
 
 // --- FUNCIONES DE EXPORTACIÓN ---
 
 /**
- * 🚀 Sube el archivo original al canal principal (USA EL CLIENTE/USUARIO) y devuelve el file_id.
+ * 🚀 Sube el archivo original y devuelve un objeto con el file_id correcto.
  */
 export async function uploadToTelegram(file) {
   try {
     await initClient(); 
-    // Usamos forceDocument: true para asegurar que el archivo completo se suba.
     const messageResult = await client.sendFile(chatId, { 
         file: file.path, 
         caption: "SnapCloud upload", 
@@ -86,11 +88,10 @@ export async function uploadToTelegram(file) {
     });
     console.log("Archivo GRANDE subido. ID de Mensaje:", messageResult.id);
 
-    // ✅ PASO ADICIONAL: Obtenemos el file_id correcto
     const fileId = await getTelegramFileId(messageResult);
     return { 
-        telegram_id: fileId, // El ID largo y correcto
-        message_id: messageResult.id // El ID corto del mensaje
+        telegram_id: fileId,
+        message_id: messageResult.id 
     };
   } catch (err) {
     console.error("Error subiendo archivo GRANDE a Telegram:", err);
@@ -99,7 +100,7 @@ export async function uploadToTelegram(file) {
 }
 
 /**
- * 🖼️ Sube la miniatura al canal del bot (USA EL CLIENTE/USUARIO) y devuelve el file_id.
+ * 🖼️ Sube la miniatura y devuelve un objeto con el file_id correcto.
  */
 export async function uploadThumbnail(thumbPath) {
   try {
@@ -107,15 +108,14 @@ export async function uploadThumbnail(thumbPath) {
     const messageResult = await client.sendFile(botChatId, { 
         file: thumbPath, 
         caption: "SnapCloud thumbnail",
-        forceDocument: false // Permitir que se suba como foto
+        forceDocument: false 
     });
     console.log("Miniatura subida. ID de Mensaje:", messageResult.id);
 
-    // ✅ PASO ADICIONAL: Obtenemos el file_id correcto
     const fileId = await getTelegramFileId(messageResult);
     return { 
-        telegram_id: fileId, // El ID largo y correcto
-        message_id: messageResult.id // El ID corto del mensaje
+        telegram_id: fileId,
+        message_id: messageResult.id 
     };
   } catch (err) {
     console.error("Error subiendo miniatura a Telegram:", err);
