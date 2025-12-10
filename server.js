@@ -3,15 +3,10 @@ import cors from "cors";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import busboy from "busboy";
-import { createClient } from "@supabase/supabase-js"; // <--- NUEVO
+import { createClient } from "@supabase/supabase-js";
+// Asumimos que uploader.js maneja la lógica de Telegram
 import { uploadFromStream, uploadThumbnailBuffer, getFileUrl, streamFile } from "./uploader.js";
 
-// --- CONFIGURACIÓN SUPABASE ---
-const supabaseUrl = process.env.SUPABASE_URL || "TU_SUPABASE_URL_AQUI";
-const supabaseKey = process.env.SUPABASE_KEY || "TU_SUPABASE_ANON_KEY_AQUI";
-const supabase = createClient(supabaseUrl, supabaseKey);
-
-// --- INICIO APP ---
 const app = express();
 const allowedOrigins = ["https://snapcloud.netlify.app", "http://localhost:5173", "http://localhost:3000"];
 
@@ -25,9 +20,19 @@ app.use(cors({
 app.use(express.json());
 const JWT_SECRET = process.env.JWT_SECRET || "secreto_super_seguro";
 
+// --- CONFIGURACIÓN SUPABASE ---
+const supabaseUrl = process.env.SUPABASE_URL; 
+const supabaseKey = process.env.SUPABASE_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+    console.error("❌ ERROR: Faltan variables de SUPABASE en Render.");
+    process.exit(1);
+}
+const supabase = createClient(supabaseUrl, supabaseKey);
+
 // --- MIDDLEWARE DE AUTH ---
-// Busca el token en Header O en la URL (para ver videos)
 function authMiddleware(req, res, next) {
+    // Busca token en Header O en URL (para streaming directo)
     const token = req.headers["authorization"]?.split("Bearer ")[1] || req.query.token;
     if (!token) return res.status(401).json({ error: "No auth" });
   
@@ -47,15 +52,13 @@ app.post("/register", async (req, res) => {
     if (!email || !password) return res.status(400).json({ error: "Faltan datos" });
 
     try {
-        // 1. Verificar si existe
         const { data: existing } = await supabase.from('users').select('*').eq('email', email).single();
         if (existing) return res.status(400).json({ error: "El correo ya está registrado" });
 
-        // 2. Crear usuario
         const hash = await bcrypt.hash(password, 10);
         const { error } = await supabase.from('users').insert([{ email, password: hash }]);
-        
         if (error) throw error;
+        
         res.json({ ok: true, message: "Usuario creado" });
     } catch (error) {
         console.error(error);
@@ -65,16 +68,11 @@ app.post("/register", async (req, res) => {
 
 app.post("/login", async (req, res) => {
     const { email, password } = req.body;
-    
     try {
-        // 1. Buscar usuario en Supabase
         const { data: user, error } = await supabase.from('users').select('*').eq('email', email).single();
-        
         if (error || !user || !await bcrypt.compare(password, user.password)) {
             return res.status(400).json({ error: "Credenciales incorrectas" });
         }
-
-        // 2. Generar token
         const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET);
         res.json({ ok: true, token });
     } catch (error) {
@@ -82,6 +80,7 @@ app.post("/login", async (req, res) => {
     }
 });
 
+// 🚀 RUTA DE SUBIDA CORREGIDA
 app.post("/upload", authMiddleware, (req, res) => {
     const bb = busboy({ headers: req.headers });
     let videoUploadPromise = null;
@@ -93,12 +92,20 @@ app.post("/upload", authMiddleware, (req, res) => {
         const { filename, mimeType: mime } = info;
 
         if (name === "thumbnail") {
+            console.log("📸 Recibiendo miniatura...");
             const chunks = [];
             file.on('data', chunk => chunks.push(chunk));
             file.on('end', () => {
-                thumbUploadPromise = uploadThumbnailBuffer(Buffer.concat(chunks)).catch(e => null);
+                const buffer = Buffer.concat(chunks);
+                if (buffer.length > 0) {
+                    thumbUploadPromise = uploadThumbnailBuffer(buffer).catch(e => {
+                        console.error("Error subiendo thumb:", e);
+                        return null;
+                    });
+                }
             });
         } else if (name === "file") {
+            console.log(`📥 Recibiendo archivo principal: ${filename}`);
             fileName = filename;
             mimeType = mime;
             const fileSize = parseInt(req.headers['content-length'] || "0");
@@ -109,19 +116,28 @@ app.post("/upload", authMiddleware, (req, res) => {
     });
 
     bb.on('close', async () => {
-        if (!videoUploadPromise) return res.status(400).json({ error: "Falta el video" });
+        if (!videoUploadPromise) return res.status(400).json({ error: "Falta el archivo principal" });
 
         try {
-            const [videoResult, thumbId] = await Promise.all([videoUploadPromise, thumbUploadPromise]);
+            const [videoResult, thumbResult] = await Promise.all([videoUploadPromise, thumbUploadPromise]);
 
-            // Guardar registro en Supabase
+            // --- CORRECCIÓN DE ID DE MINIATURA ---
+            let cleanThumbId = null;
+            if (thumbResult) {
+                // Si thumbResult es objeto (mensaje de Telegram), sacamos el ID. Si es string, lo usamos.
+                cleanThumbId = thumbResult.message_id || thumbResult;
+                // Nos aseguramos que sea string para la base de datos
+                if (typeof cleanThumbId === 'object') cleanThumbId = JSON.stringify(cleanThumbId);
+            }
+
+            // Insertar en Supabase
             const { error } = await supabase.from('files').insert([{
                 user_id: req.user.id,
                 name: fileName,
                 mime: mimeType,
-                thumbnail_id: thumbId,
-                telegram_id: videoResult.telegram_id,
-                message_id: videoResult.message_id
+                thumbnail_id: cleanThumbId ? String(cleanThumbId) : null,
+                telegram_id: videoResult.telegram_id ? String(videoResult.telegram_id) : null,
+                message_id: videoResult.message_id ? String(videoResult.message_id) : null
             }]);
 
             if (error) throw error;
@@ -138,7 +154,6 @@ app.post("/upload", authMiddleware, (req, res) => {
 
 app.get("/files", authMiddleware, async (req, res) => {
     try {
-        // Obtener archivos del usuario desde Supabase
         const { data: files, error } = await supabase
             .from('files')
             .select('*')
@@ -163,7 +178,6 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
 
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
-        // Buscar metadatos en Supabase para saber el MIME type
         const { data: fileData } = await supabase
             .from('files')
             .select('mime')
@@ -171,10 +185,8 @@ app.get("/stream/:message_id", authMiddleware, async (req, res) => {
             .single();
 
         if (fileData) res.setHeader('Content-Type', fileData.mime);
-        
         await streamFile(req.params.message_id, res);
     } catch (error) {
-        console.error(error);
         if (!res.headersSent) res.status(500).end();
     }
 });
