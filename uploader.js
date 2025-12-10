@@ -20,7 +20,7 @@ async function initClient() {
     await clientPromise;
 }
 
-// --- SUBIDA (ESTO FUNCIONA BIEN) ---
+// --- SUBIDA (Sin cambios) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
@@ -67,7 +67,7 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     };
 }
 
-// --- VISUALIZACIÓN (STREAMING CORREGIDO) ---
+// --- VISUALIZACIÓN QUIRÚRGICA ---
 export async function streamFile(messageId, res, range) {
     await initClient();
     
@@ -120,7 +120,6 @@ export async function streamFile(messageId, res, range) {
     const chunksize = (end - start) + 1;
     console.log(`🎬 Stream: ${start}-${end} (Total: ${fileSize})`);
 
-    // Headers
     if (range) {
         res.writeHead(206, {
             'Content-Range': `bytes ${start}-${end}/${fileSize}`,
@@ -135,73 +134,80 @@ export async function streamFile(messageId, res, range) {
         });
     }
 
-    // 3. Iniciar descarga inteligente
-    // Pasamos el fileSize total para no pasarnos del límite
     await streamChunksToRes(location, res, start, end, fileSize);
 }
 
-// --- FUNCIÓN CLAVE CORREGIDA ---
-async function streamChunksToRes(location, res, startByte, endByte, totalFileSize) {
-    let offset = BigInt(startByte);
-    const end = BigInt(endByte);
+// --- FUNCIÓN DE DESCARGA SEGURA ---
+async function streamChunksToRes(location, res, requestedStart, requestedEnd, totalFileSize) {
+    // Alinear el inicio al bloque de 4KB anterior (Telegram es estricto con esto)
+    // Si el navegador pide byte 100, pedimos desde el 0 y cortamos luego.
+    let currentOffset = BigInt(requestedStart - (requestedStart % 4096));
+    const end = BigInt(requestedEnd);
     const totalSize = BigInt(totalFileSize);
 
-    // Configuración de bloques
-    const MAX_CHUNK = 1024 * 1024; // 1MB (Bloque grande ideal)
-    const BLOCK_4KB = 4096;        // Mínima unidad de Telegram
+    // Calcular bytes a saltar en el primer chunk si el offset no era exacto
+    let initialSkip = requestedStart % 4096;
+
+    // Tamaño base seguro: 64KB (Potencia de 2, rápido y compatible)
+    const BASE_CHUNK = 64 * 1024; 
 
     try {
-        while (offset <= end) {
-            // 1. Calculamos cuánto nos falta para llegar al final de lo solicitado
-            // Ojo: No podemos pedir más allá del final REAL del archivo.
-            
-            // Cuánto espacio real queda en el archivo desde donde estamos:
-            const remainingInFile = totalSize - offset;
-            
-            // Si por alguna razón estamos fuera, salimos
+        while (currentOffset <= end) {
+            // Cuánto falta en el ARCHIVO REAL
+            const remainingInFile = totalSize - currentOffset;
             if (remainingInFile <= 0n) break;
 
-            // Decidimos cuánto pedir. Por defecto 1MB.
-            let bytesToRequest = MAX_CHUNK;
+            // Determinar límite: Usar BASE_CHUNK a menos que estemos al final
+            let limit = BASE_CHUNK;
 
-            // Si lo que queda en el archivo es MENOS de 1MB, ajustamos.
-            if (remainingInFile < BigInt(MAX_CHUNK)) {
-                // Truco matemático: Redondear hacia ARRIBA al múltiplo de 4096 más cercano
-                // Ejemplo: Faltan 100 bytes. Pedimos 4096.
-                // Ejemplo: Faltan 4100 bytes. Pedimos 8192.
-                const remainder = Number(remainingInFile);
-                bytesToRequest = Math.ceil(remainder / BLOCK_4KB) * BLOCK_4KB;
+            // Lógica de "Escalera" para el final del archivo
+            // Si queda menos de 64KB, usamos potencias de 2 decrecientes
+            if (remainingInFile < BigInt(BASE_CHUNK)) {
+                if (remainingInFile <= 4096n) limit = 4096;
+                else if (remainingInFile <= 8192n) limit = 8192;
+                else if (remainingInFile <= 16384n) limit = 16384;
+                else if (remainingInFile <= 32768n) limit = 32768;
+                else limit = 65536; // 64KB fallback
             }
 
-            // Llamada a la API
+            // Llamada a API
             const result = await client.invoke(new Api.upload.GetFile({
                 location: location,
-                offset: offset,
-                limit: bytesToRequest // Ahora esto siempre es "seguro"
+                offset: currentOffset,
+                limit: limit
             }));
 
             if (!result || result.bytes.length === 0) break;
 
-            // Solo enviamos al navegador la parte útil (si Telegram manda padding)
-            // Aunque normalmente Telegram manda justo lo que queda si es el final.
-            res.write(result.bytes);
-            
-            offset += BigInt(result.bytes.length);
+            let chunk = result.bytes;
 
-            // Si el cliente cierra conexión, abortar
+            // Si es el primer chunk y tuvimos que alinear hacia atrás, cortamos lo sobrante
+            if (initialSkip > 0) {
+                chunk = chunk.slice(initialSkip);
+                initialSkip = 0; // Solo se hace una vez
+            }
+
+            // Escribir al cliente
+            res.write(chunk);
+            
+            // Avanzar offset basado en lo que realmente descargamos de Telegram
+            // (IMPORTANTE: Usamos el tamaño sin cortar para el offset de Telegram)
+            currentOffset += BigInt(result.bytes.length);
+
             if (res.writableEnded || res.closed) break;
             
-            // Si recibimos menos de un bloque completo, es que se acabó
-            if (result.bytes.length < bytesToRequest) break;
+            // Si Telegram devolvió menos de lo pedido, asumimos fin de archivo
+            if (result.bytes.length < limit) break;
         }
     } catch (err) {
-        console.error("❌ Error en Stream:", err);
+        console.error("⚠️ Stream Warning:", err.message);
+        // No lanzamos error fatal para que el navegador maneje el corte si es necesario
     } finally {
         if (!res.writableEnded) res.end();
     }
 }
 
-// --- AUXILIARES ---
+// --- AUXILIARES (Sin cambios) ---
 export async function uploadThumbnailBuffer(buffer) {
     await initClient();
     const res = await client.sendFile(botChatId, { file: buffer, forceDocument: false });
