@@ -110,7 +110,6 @@ export async function streamFile(messageId, res, range) {
 
     // 2. LÓGICA DE STREAMING
     if (range) {
-        // El navegador pide una parte especifica (videos grandes/avance)
         const parts = range.replace(/bytes=/, "").split("-");
         const start = parseInt(parts[0], 10);
         const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
@@ -127,7 +126,6 @@ export async function streamFile(messageId, res, range) {
 
         await streamChunksToRes(location, res, start, end);
     } else {
-        // El navegador pide todo (archivos pequeños)
         console.log(`⬇️ Descarga Completa: ${fileSize} bytes`);
         res.writeHead(200, {
             'Content-Length': fileSize,
@@ -137,31 +135,32 @@ export async function streamFile(messageId, res, range) {
     }
 }
 
-// Función auxiliar para descargar y enviar bytes
+// --- CORRECCIÓN AQUÍ: Función auxiliar para descargar y enviar bytes ---
 async function streamChunksToRes(location, res, startByte, endByte) {
     let offset = BigInt(startByte);
     const end = BigInt(endByte);
-    const KB = 1024 * 1024; // Pedimos bloques de 1MB para mayor velocidad
+    
+    // IMPORTANTE: El límite SIEMPRE debe ser múltiplo de 4KB (4096 bytes).
+    // Usamos 512KB (512 * 1024) que es seguro y rápido.
+    const REQUEST_LIMIT = 512 * 1024; 
 
     try {
         while (offset <= end) {
-            // Calculamos límite seguro
-            let limit = BigInt(KB);
-            if (offset + limit > end) {
-                limit = end - offset + 1n;
-            }
-
-            // Petición a Telegram
+            // Ya NO calculamos un límite dinámico. Pedimos siempre el bloque completo.
+            // Telegram gestionará internamente si queda menos archivo.
+            
             const result = await client.invoke(new Api.upload.GetFile({
                 location: location,
                 offset: offset,
-                limit: Number(limit)
+                limit: REQUEST_LIMIT // Siempre constante para evitar LIMIT_INVALID
             }));
 
             if (!result || result.bytes.length === 0) break;
 
             // Enviar al cliente
             res.write(result.bytes);
+            
+            // Avanzamos el offset según lo que REALMENTE nos devolvió Telegram
             offset += BigInt(result.bytes.length);
 
             // Si el cliente cierra la conexión (pausa video, cierra pestaña), abortamos
