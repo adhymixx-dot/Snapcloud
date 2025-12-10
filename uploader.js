@@ -1,5 +1,6 @@
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
+import { Buffer } from 'buffer'; // Aseguramos Buffer
 
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
@@ -19,7 +20,7 @@ async function initClient() {
     await clientPromise;
 }
 
-// --- SUBIDA (UPLOAD) ---
+// --- SUBIDA (SIN CAMBIOS) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
@@ -61,7 +62,6 @@ export async function uploadThumbnailBuffer(buffer) {
     return await getTelegramFileId(res.id, botChatId);
 }
 
-// --- OBTENER URL (REPARADO) ---
 export async function getFileUrl(fileId) {
     if (!BOT_TOKEN) return null;
     try {
@@ -72,7 +72,7 @@ export async function getFileUrl(fileId) {
     return null;
 }
 
-// --- VISUALIZACIÓN (REPARADO) ---
+// --- VISUALIZACIÓN (SOLUCIÓN MANUAL DEFINITIVA) ---
 export async function streamFile(messageId, res) {
     await initClient();
     console.log(`🔍 Buscando ID para stream: ${messageId}`);
@@ -82,35 +82,69 @@ export async function streamFile(messageId, res) {
     
     const msg = msgs[0];
 
-    // Lógica para extraer el archivo real (Documento o Foto)
-    // Esto evita el error "Cannot cast undefined"
-    let mediaToDownload = null;
-
-    if (msg.media) {
-        if (msg.media.document) {
-            mediaToDownload = msg.media.document;
-        } else if (msg.media.photo) {
-            mediaToDownload = msg.media.photo;
-        } else {
-            mediaToDownload = msg.media;
-        }
-    }
-
-    if (!mediaToDownload) throw new Error("No hay media en el mensaje");
+    // AQUÍ ESTÁ EL TRUCO: Construimos la ubicación manualmente.
+    // Esto evita que la librería intente "adivinar" y falle.
+    let inputLocation = null;
+    let dcId = null;
 
     try {
-        const stream = client.iterDownload(mediaToDownload, { 
+        if (msg.media) {
+            if (msg.media.document) {
+                // Es un VIDEO o DOCUMENTO
+                console.log("📂 Procesando Documento...");
+                const doc = msg.media.document;
+                dcId = doc.dcId;
+                
+                inputLocation = new Api.InputDocumentFileLocation({
+                    id: doc.id,
+                    accessHash: doc.accessHash,
+                    fileReference: doc.fileReference,
+                    thumbSize: "" // Vacio = original
+                });
+
+            } else if (msg.media.photo) {
+                // Es una FOTO
+                console.log("📸 Procesando Foto...");
+                const photo = msg.media.photo;
+                dcId = photo.dcId;
+                
+                // Usamos la última versión (la más grande)
+                const sizes = photo.sizes;
+                const largest = sizes[sizes.length - 1];
+                
+                inputLocation = new Api.InputPhotoFileLocation({
+                    id: photo.id,
+                    accessHash: photo.accessHash,
+                    fileReference: photo.fileReference,
+                    thumbSize: largest.type
+                });
+            }
+        }
+    } catch (e) {
+        console.error("Error construyendo ubicación:", e);
+    }
+
+    if (!inputLocation) {
+        throw new Error("No se pudo determinar la ubicación del archivo.");
+    }
+
+    console.log("▶️ Iniciando transmisión...");
+
+    try {
+        // Pasamos la ubicación manual construida
+        const stream = client.iterDownload(inputLocation, { 
             chunkSize: 64 * 1024,
-            dcId: mediaToDownload.dcId || null
+            dcId: dcId,
+            fileSize: msg.media.document ? msg.media.document.size : undefined
         });
 
         for await (const chunk of stream) {
             res.write(chunk);
         }
         res.end();
-        console.log("✅ Visualización completada.");
+        console.log("✅ Stream completado.");
     } catch (err) {
-        console.error("❌ Error interno iterDownload:", err);
+        console.error("❌ Error en iterDownload:", err);
         throw err;
     }
 }
