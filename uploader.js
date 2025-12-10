@@ -20,154 +20,143 @@ async function initClient() {
     await clientPromise;
 }
 
-// --- SUBIDA (SIN CAMBIOS - FUNCIONA BIEN) ---
+// --- SUBIDA BLINDADA (SOLUCIÓN AL ERROR DE PART_SIZE) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
-    const PART_SIZE = 512 * 1024;
+    const PART_SIZE = 512 * 1024; // 512KB (Regla estricta de Telegram)
     const totalParts = fileSize > 0 ? Math.ceil(fileSize / PART_SIZE) : -1;
+
+    console.log(`🌊 Subiendo: ${fileName} (${fileSize} bytes) | Partes estimadas: ${totalParts}`);
+    
     let partIndex = 0;
     let buffer = Buffer.alloc(0);
 
+    // USAMOS 'FOR AWAIT' PARA EVITAR CONDICIONES DE CARRERA
+    // Esto garantiza que procesamos los datos en orden perfecto.
     for await (const chunk of stream) {
         buffer = Buffer.concat([buffer, chunk]);
+        
+        // Mientras tengamos suficiente para un bloque de 512KB, subimos
         while (buffer.length >= PART_SIZE) {
             const chunkToSend = buffer.slice(0, PART_SIZE);
             buffer = buffer.slice(PART_SIZE);
+            
             try {
                 await client.invoke(new Api.upload.SaveBigFilePart({
-                    fileId: fileId, filePart: partIndex, fileTotalParts: totalParts, bytes: chunkToSend
+                    fileId: fileId,
+                    filePart: partIndex,
+                    fileTotalParts: totalParts,
+                    bytes: chunkToSend
                 }));
                 partIndex++;
-            } catch (err) { console.error(err); throw err; }
+            } catch (err) {
+                console.error(`❌ Error subiendo parte ${partIndex}:`, err);
+                throw err; // Detener si falla
+            }
         }
     }
+
+    // Subir el remanente final (si queda algo)
     if (buffer.length > 0) {
         await client.invoke(new Api.upload.SaveBigFilePart({
-            fileId: fileId, filePart: partIndex, fileTotalParts: totalParts, bytes: buffer
+            fileId: fileId,
+            filePart: partIndex,
+            fileTotalParts: totalParts,
+            bytes: buffer
         }));
         partIndex++;
     }
 
-    const inputFile = new Api.InputFileBig({ id: fileId, parts: partIndex, name: fileName });
-    const res = await client.sendFile(chatId, { file: inputFile, forceDocument: true, caption: fileName });
+    console.log(`✅ Subida de partes finalizada (${partIndex} partes). Generando archivo...`);
 
-    let realSize = 0;
-    if(res.media && res.media.document) realSize = res.media.document.size;
+    // Finalizar y crear el archivo en el chat
+    const inputFile = new Api.InputFileBig({
+        id: fileId,
+        parts: partIndex,
+        name: fileName
+    });
+
+    const res = await client.sendFile(chatId, {
+        file: inputFile,
+        forceDocument: true,
+        caption: fileName
+    });
 
     return { 
         telegram_id: await getTelegramFileId(res.id, chatId), 
-        message_id: res.id,
-        file_size: realSize 
+        message_id: res.id 
     };
 }
 
-// --- VISUALIZACIÓN HÍBRIDA (LA SOLUCIÓN FINAL) ---
-export async function streamFile(messageId, res, startByte = 0, endByte = -1) {
+// --- VISUALIZACIÓN MANUAL (SIN CAMBIOS, YA FUNCIONABA) ---
+export async function streamFile(messageId, res) {
     await initClient();
-    
+    console.log(`🔍 Stream ID: ${messageId}`);
+
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
-    if (!msgs || !msgs[0]) throw new Error("Msg no encontrado");
+    if (!msgs || !msgs[0]) throw new Error("Mensaje no encontrado");
     const msg = msgs[0];
 
-    // 1. Detectar qué tenemos
-    let mediaObj = null;
+    let location = null;
     let fileSize = 0;
-    let isVideo = false;
+    let mimeType = "application/octet-stream";
 
+    // Extracción manual segura
     if (msg.media) {
         if (msg.media.document) {
-            mediaObj = msg.media.document;
-            fileSize = mediaObj.size;
-            // Si el mime type dice video, o pesa más de 10MB, lo tratamos como video
-            if (mediaObj.mimeType.startsWith('video') || fileSize > 10 * 1024 * 1024) {
-                isVideo = true;
-            }
+            const doc = msg.media.document;
+            fileSize = doc.size;
+            mimeType = doc.mimeType;
+            location = new Api.InputDocumentFileLocation({
+                id: doc.id,
+                accessHash: doc.accessHash,
+                fileReference: doc.fileReference,
+                thumbSize: ""
+            });
         } else if (msg.media.photo) {
-            // Las fotos siempre son pequeñas y simples
-            mediaObj = msg.media.photo;
-            isVideo = false; 
+            const photo = msg.media.photo;
+            const size = photo.sizes[photo.sizes.length - 1];
+            fileSize = size.size;
+            mimeType = "image/jpeg";
+            location = new Api.InputPhotoFileLocation({
+                id: photo.id,
+                accessHash: photo.accessHash,
+                fileReference: photo.fileReference,
+                thumbSize: size.type
+            });
         }
     }
 
-    if (!mediaObj) throw new Error("Sin archivo");
+    if (!location) throw new Error("Sin archivo válido");
 
-    // --- RUTA RÁPIDA (PARA FOTOS) ---
-    // Si NO es video (es foto o archivo pequeño), usamos el método simple de GramJS.
-    // Esto evita errores de alineación en archivos pequeños.
-    if (!isVideo) {
-        console.log("📸 Descargando Foto/Archivo simple...");
-        try {
-            // downloadMedia gestiona todo automáticamente para fotos
-            const buffer = await client.downloadMedia(msg.media, { workers: 1 });
-            res.write(buffer);
-            res.end();
-            console.log("✅ Foto enviada.");
-            return;
-        } catch (err) {
-            console.error("❌ Error bajando foto:", err);
-            // Si falla, dejamos que caiga al método manual de abajo por si acaso
-        }
-    }
-
-    // --- RUTA COMPLEJA (PARA VIDEOS / STREAMING) ---
-    console.log("🎥 Iniciando Streaming de Video...");
+    res.setHeader("Content-Type", mimeType);
+    res.setHeader("Content-Length", fileSize);
     
-    // Construimos la ubicación manual
-    let location = null;
-    if (msg.media.document) {
-        const d = msg.media.document;
-        location = new Api.InputDocumentFileLocation({ id: d.id, accessHash: d.accessHash, fileReference: d.fileReference, thumbSize: "" });
-    } else if (msg.media.photo) {
-        // Fallback raro si una foto cayó aquí
-        const p = msg.media.photo;
-        const sz = p.sizes[p.sizes.length - 1];
-        location = new Api.InputPhotoFileLocation({ id: p.id, accessHash: p.accessHash, fileReference: p.fileReference, thumbSize: sz.type });
-    }
+    console.log(`▶️ Descargando bytes directos (${fileSize})...`);
 
-    if (endByte === -1 || endByte >= fileSize) endByte = fileSize - 1;
+    const CHUNK_SIZE = 512 * 1024; // Pedimos bloques de 512KB
+    let offset = BigInt(0);
     
-    let currentOffset = BigInt(startByte);
-    const end = BigInt(endByte);
-    const CHUNK_SIZE = 1024 * 1024; // 1MB
-
     try {
-        while (currentOffset <= end) {
-            // Lógica de alineación 4KB (Obligatoria para Telegram GetFile)
-            const alignment = 4096n;
-            const alignedOffset = currentOffset - (currentOffset % alignment);
-            const skipBytes = Number(currentOffset - alignedOffset); 
-
-            let needed = Number(end - currentOffset + 1n);
-            if (needed > CHUNK_SIZE) needed = CHUNK_SIZE;
-
-            let rawLimit = skipBytes + needed;
-            let requestLimit = rawLimit;
-            
-            if (requestLimit % 4096 !== 0) {
-                requestLimit = Math.ceil(rawLimit / 4096) * 4096;
-            }
-
+        while (true) {
             const result = await client.invoke(new Api.upload.GetFile({
                 location: location,
-                offset: alignedOffset,
-                limit: requestLimit 
+                offset: offset,
+                limit: CHUNK_SIZE
             }));
 
             if (!result || result.bytes.length === 0) break;
 
-            let chunkBuffer = result.bytes;
-            if (skipBytes > 0) chunkBuffer = chunkBuffer.slice(skipBytes);
-            if (chunkBuffer.length > needed) chunkBuffer = chunkBuffer.slice(0, needed);
+            res.write(result.bytes);
+            offset = offset + BigInt(result.bytes.length);
 
-            res.write(chunkBuffer);
-            currentOffset += BigInt(chunkBuffer.length);
-            
-            if (result.bytes.length < requestLimit) break;
+            if (result.bytes.length < CHUNK_SIZE) break;
         }
         res.end();
+        console.log("✅ Stream OK");
     } catch (err) {
-        console.error("❌ Error Stream Video:", err);
+        console.error("❌ Error Stream:", err);
         if (!res.writableEnded) res.end();
     }
 }

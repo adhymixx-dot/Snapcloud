@@ -4,18 +4,13 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import busboy from "busboy";
 import { createClient } from "@supabase/supabase-js";
-// Importamos las funciones del uploader (que ya arreglamos en el paso anterior)
 import { uploadFromStream, uploadThumbnailBuffer, getFileUrl, streamFile } from "./uploader.js";
 
 const app = express();
 app.use(cors({ origin: "*" })); 
 app.use(express.json());
 
-const JWT_SECRET = process.env.JWT_SECRET || "secreto_super_seguro";
-
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
-    console.error("❌ ERROR: Faltan variables de SUPABASE.");
-}
+const JWT_SECRET = process.env.JWT_SECRET || "secreto";
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 function authMiddleware(req, res, next) {
@@ -28,12 +23,12 @@ function authMiddleware(req, res, next) {
     } catch (err) { res.status(401).json({ error: "Token inválido" }); }
 }
 
-// --- RUTAS DE USUARIO ---
+// --- RUTAS AUTH ---
 app.post("/register", async (req, res) => {
     const { email, password } = req.body;
     try {
         const { data: existing } = await supabase.from('users').select('*').eq('email', email).single();
-        if (existing) return res.status(400).json({ error: "Correo ya registrado" });
+        if (existing) return res.status(400).json({ error: "Ya existe" });
         const hash = await bcrypt.hash(password, 10);
         await supabase.from('users').insert([{ email, password: hash }]);
         res.json({ ok: true });
@@ -44,13 +39,13 @@ app.post("/login", async (req, res) => {
     const { email, password } = req.body;
     try {
         const { data: user } = await supabase.from('users').select('*').eq('email', email).single();
-        if (!user || !await bcrypt.compare(password, user.password)) return res.status(400).json({ error: "Credenciales inválidas" });
+        if (!user || !await bcrypt.compare(password, user.password)) return res.status(400).json({ error: "Error login" });
         const token = jwt.sign({ id: user.id }, JWT_SECRET);
         res.json({ ok: true, token });
     } catch (e) { res.status(500).json({ error: "Error login" }); }
 });
 
-// --- SUBIDA ---
+// --- UPLOAD ---
 app.post("/upload", authMiddleware, (req, res) => {
     const bb = busboy({ headers: req.headers });
     let vidP = null, thP = Promise.resolve(null);
@@ -73,13 +68,10 @@ app.post("/upload", authMiddleware, (req, res) => {
             let tId = th ? (th.message_id || th) : null;
             if (typeof tId === 'object') tId = JSON.stringify(tId);
 
-            const sizeToSave = vid.file_size || null;
-
             await supabase.from('files').insert([{
                 user_id: req.user.id, name: fName, mime: mime,
                 thumbnail_id: tId ? String(tId) : null,
-                telegram_id: String(vid.telegram_id), message_id: String(vid.message_id),
-                size: sizeToSave
+                telegram_id: String(vid.telegram_id), message_id: String(vid.message_id)
             }]);
             res.json({ ok: true });
         } catch (e) { console.error(e); if(!res.headersSent) res.status(500).json({ error: e.message }); }
@@ -97,48 +89,22 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     res.json({ url });
 });
 
-// --- STREAMING (SOLUCIÓN ERROR 404 & LIMIT_INVALID) ---
-// Nota: La lógica pesada de corrección ya está en uploader.js, aquí solo llamamos.
+// --- STREAMING (VISUALIZACIÓN) ---
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
-        const { data: fileData, error } = await supabase.from('files').select('*').eq('message_id', req.params.message_id).single();
+        console.log(`📡 Stream: ${req.params.message_id}`);
+        const { data: f } = await supabase.from('files').select('mime, name').eq('message_id', req.params.message_id).single();
 
-        if (error || !fileData) {
-            console.error("❌ Error DB buscando archivo:", error);
-            return res.status(404).send("Archivo no encontrado en DB");
+        if (f) {
+            res.setHeader('Content-Type', f.mime);
+            // IMPORTANTE: 'inline' fuerza la visualización
+            res.setHeader('Content-Disposition', `inline; filename="${f.name}"`);
         }
-
-        // Fallback de tamaño si es antiguo
-        const fileSize = fileData.size || 50 * 1024 * 1024; 
-        const range = req.headers.range;
-
-        res.setHeader('Content-Type', fileData.mime);
-        res.setHeader('Content-Disposition', `inline; filename="${fileData.name}"`);
-        res.setHeader('Accept-Ranges', 'bytes');
-
-        if (range) {
-            const parts = range.replace(/bytes=/, "").split("-");
-            const start = parseInt(parts[0], 10);
-            const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-            const chunksize = (end - start) + 1;
-
-            res.status(206);
-            res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
-            res.setHeader('Content-Length', chunksize);
-
-            // Llamamos a la función ARREGLADA en uploader.js
-            await streamFile(req.params.message_id, res, start, end);
-        } else {
-            res.setHeader('Content-Length', fileSize);
-            // Llamamos a la función ARREGLADA en uploader.js
-            await streamFile(req.params.message_id, res, 0, fileSize - 1);
-        }
-
+        await streamFile(req.params.message_id, res);
     } catch (error) {
         console.error("❌ Error Stream:", error);
         if (!res.headersSent) res.status(500).end();
     }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Servidor listo en puerto ${PORT}`));
+app.listen(process.env.PORT || 3000, () => console.log("🚀 Server Ready"));
