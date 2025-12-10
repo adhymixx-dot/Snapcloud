@@ -4,7 +4,6 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import busboy from "busboy";
 import { createClient } from "@supabase/supabase-js";
-// Asumimos que uploader.js maneja la lógica de Telegram
 import { uploadFromStream, uploadThumbnailBuffer, getFileUrl, streamFile } from "./uploader.js";
 
 const app = express();
@@ -21,7 +20,7 @@ app.use(express.json());
 const JWT_SECRET = process.env.JWT_SECRET || "secreto_super_seguro";
 
 // --- CONFIGURACIÓN SUPABASE ---
-const supabaseUrl = process.env.SUPABASE_URL; 
+const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 
 if (!supabaseUrl || !supabaseKey) {
@@ -32,7 +31,7 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 // --- MIDDLEWARE DE AUTH ---
 function authMiddleware(req, res, next) {
-    // Busca token en Header O en URL (para streaming directo)
+    // Busca token en Header O en la URL (necesario para el reproductor de video)
     const token = req.headers["authorization"]?.split("Bearer ")[1] || req.query.token;
     if (!token) return res.status(401).json({ error: "No auth" });
   
@@ -80,7 +79,6 @@ app.post("/login", async (req, res) => {
     }
 });
 
-// 🚀 RUTA DE SUBIDA CORREGIDA
 app.post("/upload", authMiddleware, (req, res) => {
     const bb = busboy({ headers: req.headers });
     let videoUploadPromise = null;
@@ -92,20 +90,16 @@ app.post("/upload", authMiddleware, (req, res) => {
         const { filename, mimeType: mime } = info;
 
         if (name === "thumbnail") {
-            console.log("📸 Recibiendo miniatura...");
             const chunks = [];
             file.on('data', chunk => chunks.push(chunk));
             file.on('end', () => {
                 const buffer = Buffer.concat(chunks);
                 if (buffer.length > 0) {
-                    thumbUploadPromise = uploadThumbnailBuffer(buffer).catch(e => {
-                        console.error("Error subiendo thumb:", e);
-                        return null;
-                    });
+                    thumbUploadPromise = uploadThumbnailBuffer(buffer).catch(e => null);
                 }
             });
         } else if (name === "file") {
-            console.log(`📥 Recibiendo archivo principal: ${filename}`);
+            console.log(`📥 Recibiendo archivo: ${filename}`);
             fileName = filename;
             mimeType = mime;
             const fileSize = parseInt(req.headers['content-length'] || "0");
@@ -121,16 +115,12 @@ app.post("/upload", authMiddleware, (req, res) => {
         try {
             const [videoResult, thumbResult] = await Promise.all([videoUploadPromise, thumbUploadPromise]);
 
-            // --- CORRECCIÓN DE ID DE MINIATURA ---
             let cleanThumbId = null;
             if (thumbResult) {
-                // Si thumbResult es objeto (mensaje de Telegram), sacamos el ID. Si es string, lo usamos.
                 cleanThumbId = thumbResult.message_id || thumbResult;
-                // Nos aseguramos que sea string para la base de datos
                 if (typeof cleanThumbId === 'object') cleanThumbId = JSON.stringify(cleanThumbId);
             }
 
-            // Insertar en Supabase
             const { error } = await supabase.from('files').insert([{
                 user_id: req.user.id,
                 name: fileName,
@@ -172,7 +162,7 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
         const url = await getFileUrl(req.params.file_id);
         res.json({ url });
     } catch (error) {
-        res.status(500).json({ error: "Error obteniendo URL" });
+        res.status(500).json({ error: "Error URL" });
     }
 });
 
