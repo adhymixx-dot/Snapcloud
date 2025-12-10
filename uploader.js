@@ -12,27 +12,40 @@ const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 
 let clientPromise = null;
 
 async function initClient() {
-    if (!clientPromise) { console.log("🔌 Telegram conectando..."); clientPromise = client.connect(); }
+    if (!clientPromise) { 
+        console.log("🔌 Telegram conectando..."); 
+        clientPromise = client.connect(); 
+    }
     await clientPromise;
 }
 
-// --- SUBIDA (SIN CAMBIOS) ---
+// --- SUBIDA (UPLOAD) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
-    let partIndex = 0, buffer = Buffer.alloc(0); const partSize = 512*1024;
+    let partIndex = 0, buffer = Buffer.alloc(0); 
+    const partSize = 512*1024;
     
     await new Promise((resolve, reject) => {
         stream.on('data', async (chunk) => {
             buffer = Buffer.concat([buffer, chunk]);
             if (buffer.length >= partSize) {
                 stream.pause();
-                const chunkToSend = buffer.slice(0, partSize); buffer = buffer.slice(partSize);
-                try { await client.invoke(new Api.upload.SaveBigFilePart({ fileId, filePart: partIndex, fileTotalParts: -1, bytes: chunkToSend })); partIndex++; stream.resume(); } catch (e) { reject(e); }
+                const chunkToSend = buffer.slice(0, partSize); 
+                buffer = buffer.slice(partSize);
+                try { 
+                    await client.invoke(new Api.upload.SaveBigFilePart({ fileId, filePart: partIndex, fileTotalParts: -1, bytes: chunkToSend })); 
+                    partIndex++; 
+                    stream.resume(); 
+                } catch (e) { reject(e); }
             }
         });
         stream.on('end', async () => {
-            if (buffer.length > 0) await client.invoke(new Api.upload.SaveBigFilePart({ fileId, filePart: partIndex, fileTotalParts: -1, bytes: buffer }));
+            if (buffer.length > 0) {
+                try {
+                    await client.invoke(new Api.upload.SaveBigFilePart({ fileId, filePart: partIndex, fileTotalParts: -1, bytes: buffer }));
+                } catch (e) { reject(e); }
+            }
             resolve();
         });
     });
@@ -48,7 +61,18 @@ export async function uploadThumbnailBuffer(buffer) {
     return await getTelegramFileId(res.id, botChatId);
 }
 
-// --- VISUALIZACIÓN (REPARADO MANUALMENTE) ---
+// --- FUNCIÓN QUE FALTABA (SOLUCIÓN AL ERROR) ---
+export async function getFileUrl(fileId) {
+    if (!BOT_TOKEN) return null;
+    try {
+        const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`);
+        const d = await res.json();
+        if (d.ok) return `https://api.telegram.org/file/bot${BOT_TOKEN}/${d.result.file_path}`;
+    } catch (e) {} 
+    return null;
+}
+
+// --- VISUALIZACIÓN (STREAMING BLINDADO) ---
 export async function streamFile(messageId, res) {
     await initClient();
     console.log(`🔍 Buscando ID: ${messageId}`);
@@ -58,7 +82,6 @@ export async function streamFile(messageId, res) {
     const msg = msgs[0];
 
     // CONSTRUCCIÓN MANUAL DE LA UBICACIÓN DEL ARCHIVO
-    // Esto evita el error "Cannot cast undefined" y permite ver el video.
     let location = null;
     
     if (msg.media) {
@@ -67,6 +90,7 @@ export async function streamFile(messageId, res) {
             location = new Api.InputDocumentFileLocation({ id: d.id, accessHash: d.accessHash, fileReference: d.fileReference, thumbSize: "" });
         } else if (msg.media.photo) {
             const p = msg.media.photo;
+            // Buscamos el tamaño más grande disponible
             const sz = p.sizes[p.sizes.length-1].type;
             location = new Api.InputPhotoFileLocation({ id: p.id, accessHash: p.accessHash, fileReference: p.fileReference, thumbSize: sz });
         }
@@ -81,6 +105,7 @@ export async function streamFile(messageId, res) {
     res.end();
 }
 
+// Helper interno
 async function getTelegramFileId(msgId, chId) {
     if(!BOT_TOKEN) return null;
     try {
