@@ -11,8 +11,9 @@ function getRequiredEnv(varName) {
 const apiId = Number(getRequiredEnv("TELEGRAM_API_ID"));
 const apiHash = getRequiredEnv("TELEGRAM_API_HASH");
 const sessionString = getRequiredEnv("TELEGRAM_SESSION");
+// Aseguramos que el ID del canal se lea correctamente como BigInt (incluso si es negativo)
 const chatId = BigInt(getRequiredEnv("TELEGRAM_CHANNEL_ID")); 
-const botChatId = BigInt(process.env.BOT_CHANNEL_ID || chatId); // Opcional, fallback al mismo
+const botChatId = BigInt(process.env.BOT_CHANNEL_ID || chatId); 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
 const session = new StringSession(sessionString);
@@ -26,13 +27,13 @@ async function initClient() {
         clientPromise = client.connect();
     }
     await clientPromise;
-    // Verificación rápida de sesión
+    // Verificación rápida de que estamos logueados
     if(!await client.checkAuthorization()) {
         throw new Error("❌ LA SESIÓN DE TELEGRAM HA EXPIRADO. Genera una nueva.");
     }
 }
 
-// --- SUBIDA ---
+// --- SUBIDA (UPLOAD) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     console.log(`🌊 Subiendo stream: ${fileName}`);
@@ -74,7 +75,7 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     const inputFile = new Api.InputFileBig({ id: fileId, parts: partIndex + 1, name: fileName });
     const messageResult = await client.sendFile(chatId, { file: inputFile, caption: "SnapCloud File", forceDocument: true });
     
-    // Obtenemos un ID compatible usando el bot
+    // Obtenemos el ID compatible
     const finalFileId = await getTelegramFileId(messageResult.id, chatId);
     return { telegram_id: finalFileId, message_id: messageResult.id };
 }
@@ -109,7 +110,6 @@ async function getTelegramFileId(messageId, channelIdBigInt) {
         if (fwd.document) fid = fwd.document.file_id;
         else if (fwd.photo) fid = fwd.photo[fwd.photo.length - 1].file_id;
         
-        // Limpieza
         await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -130,11 +130,13 @@ export async function getFileUrl(fileId) {
     } catch (e) { return null; }
 }
 
-// --- STREAMING (CRÍTICO) ---
+// --- STREAMING (AQUÍ ESTABA EL ERROR) ---
 export async function streamFile(messageId, res) {
     await initClient();
     
-    // Buscamos el mensaje en el canal
+    console.log(`🔍 Buscando mensaje ID: ${messageId} en canal: ${chatId}`);
+
+    // Obtenemos el mensaje
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
     
     if (!msgs || msgs.length === 0 || !msgs[0]) {
@@ -142,12 +144,18 @@ export async function streamFile(messageId, res) {
     }
     
     const msg = msgs[0];
-    if (!msg.media) {
-        throw new Error("El mensaje existe pero no tiene archivo adjunto.");
+
+    // Verificamos si es un mensaje vacío (pasa a veces si no hay acceso)
+    if (!msg.media && !msg.document && !msg.photo) {
+        console.log("Dump del mensaje:", msg); // Para ver en logs qué llegó
+        throw new Error("El mensaje existe pero no tiene media o no es accesible.");
     }
 
-    // Streaming directo
-    const stream = client.iterDownload(msg.media, { chunkSize: 128 * 1024 });
+    // CORRECCIÓN: Pasamos 'msg' (el objeto entero), NO 'msg.media'
+    // Esto permite a GramJS saber de qué chat descargar el archivo.
+    const stream = client.iterDownload(msg, { 
+        chunkSize: 64 * 1024, // Ajustado para ser más estable
+    });
     
     res.on('close', () => {
         console.log("Cliente cerró conexión, deteniendo stream.");
