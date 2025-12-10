@@ -4,6 +4,7 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import busboy from "busboy";
 import { createClient } from "@supabase/supabase-js";
+// Asumimos que uploader.js maneja la lógica de Telegram
 import { uploadFromStream, uploadThumbnailBuffer, getFileUrl, streamFile } from "./uploader.js";
 
 const app = express();
@@ -20,7 +21,7 @@ app.use(express.json());
 const JWT_SECRET = process.env.JWT_SECRET || "secreto_super_seguro";
 
 // --- CONFIGURACIÓN SUPABASE ---
-const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseUrl = process.env.SUPABASE_URL; 
 const supabaseKey = process.env.SUPABASE_KEY;
 
 if (!supabaseUrl || !supabaseKey) {
@@ -31,7 +32,7 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 // --- MIDDLEWARE DE AUTH ---
 function authMiddleware(req, res, next) {
-    // Busca token en Header O en la URL (importante para el reproductor de video)
+    // Busca token en Header O en URL (para streaming directo)
     const token = req.headers["authorization"]?.split("Bearer ")[1] || req.query.token;
     if (!token) return res.status(401).json({ error: "No auth" });
   
@@ -44,7 +45,7 @@ function authMiddleware(req, res, next) {
     }
 }
 
-// --- RUTAS DE USUARIO ---
+// --- RUTAS ---
 
 app.post("/register", async (req, res) => {
     const { email, password } = req.body;
@@ -79,8 +80,7 @@ app.post("/login", async (req, res) => {
     }
 });
 
-// --- RUTAS DE ARCHIVOS ---
-
+// 🚀 RUTA DE SUBIDA CORREGIDA
 app.post("/upload", authMiddleware, (req, res) => {
     const bb = busboy({ headers: req.headers });
     let videoUploadPromise = null;
@@ -92,13 +92,14 @@ app.post("/upload", authMiddleware, (req, res) => {
         const { filename, mimeType: mime } = info;
 
         if (name === "thumbnail") {
+            console.log("📸 Recibiendo miniatura...");
             const chunks = [];
             file.on('data', chunk => chunks.push(chunk));
             file.on('end', () => {
                 const buffer = Buffer.concat(chunks);
                 if (buffer.length > 0) {
                     thumbUploadPromise = uploadThumbnailBuffer(buffer).catch(e => {
-                        console.error("Error subiendo miniatura:", e);
+                        console.error("Error subiendo thumb:", e);
                         return null;
                     });
                 }
@@ -120,10 +121,12 @@ app.post("/upload", authMiddleware, (req, res) => {
         try {
             const [videoResult, thumbResult] = await Promise.all([videoUploadPromise, thumbUploadPromise]);
 
-            // Limpieza del ID de la miniatura
+            // --- CORRECCIÓN DE ID DE MINIATURA ---
             let cleanThumbId = null;
             if (thumbResult) {
+                // Si thumbResult es objeto (mensaje de Telegram), sacamos el ID. Si es string, lo usamos.
                 cleanThumbId = thumbResult.message_id || thumbResult;
+                // Nos aseguramos que sea string para la base de datos
                 if (typeof cleanThumbId === 'object') cleanThumbId = JSON.stringify(cleanThumbId);
             }
 
@@ -141,7 +144,7 @@ app.post("/upload", authMiddleware, (req, res) => {
 
             res.json({ ok: true, message: "Subido exitosamente" });
         } catch (err) {
-            console.error("Error en upload:", err);
+            console.error(err);
             if (!res.headersSent) res.status(500).json({ error: err.message });
         }
     });
@@ -169,38 +172,21 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
         const url = await getFileUrl(req.params.file_id);
         res.json({ url });
     } catch (error) {
-        res.status(500).json({ error: "Error URL" });
+        res.status(500).json({ error: "Error obteniendo URL" });
     }
 });
 
-// --- RUTA CORREGIDA PARA EL ERROR 500 ---
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
-        // 1. Convertir el ID de la URL (String) a Número (Integer)
-        // Telegram necesita números, si le pasas texto falla.
-        const messageId = parseInt(req.params.message_id);
-
-        if (isNaN(messageId)) {
-            console.error(`ID inválido recibido: ${req.params.message_id}`);
-            return res.status(400).json({ error: "ID de archivo inválido" });
-        }
-
-        // 2. Obtener tipo de archivo (MIME) de Supabase para el navegador
         const { data: fileData } = await supabase
             .from('files')
             .select('mime')
-            .eq('message_id', messageId.toString()) // Buscamos en BD
-            .maybeSingle();
+            .eq('message_id', req.params.message_id)
+            .single();
 
-        if (fileData && fileData.mime) {
-            res.setHeader('Content-Type', fileData.mime);
-        }
-
-        // 3. Iniciar descarga desde Telegram usando el ID numérico
-        await streamFile(messageId, res);
-
+        if (fileData) res.setHeader('Content-Type', fileData.mime);
+        await streamFile(req.params.message_id, res);
     } catch (error) {
-        console.error("❌ Error CRÍTICO en stream:", error);
         if (!res.headersSent) res.status(500).end();
     }
 });
