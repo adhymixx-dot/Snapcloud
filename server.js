@@ -1,156 +1,180 @@
 import express from "express";
 import cors from "cors";
-import fs from "fs";
-import path from "path";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-import busboy from "busboy"; 
-import { uploadFromStream, uploadThumbnailBuffer, getFileUrl, streamFile } from "./uploader.js"; 
+import busboy from "busboy";
+import { createClient } from "@supabase/supabase-js"; // <--- NUEVO
+import { uploadFromStream, uploadThumbnailBuffer, getFileUrl, streamFile } from "./uploader.js";
 
+// --- CONFIGURACIÓN SUPABASE ---
+const supabaseUrl = process.env.SUPABASE_URL || "TU_SUPABASE_URL_AQUI";
+const supabaseKey = process.env.SUPABASE_KEY || "TU_SUPABASE_ANON_KEY_AQUI";
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// --- INICIO APP ---
 const app = express();
 const allowedOrigins = ["https://snapcloud.netlify.app", "http://localhost:5173", "http://localhost:3000"];
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Permitir solicitudes sin origen (como apps móviles o curl) o de orígenes permitidos
     if (!origin || allowedOrigins.includes(origin)) callback(null, true);
     else callback(new Error('No permitido por CORS'));
   }
 }));
 
 app.use(express.json());
+const JWT_SECRET = process.env.JWT_SECRET || "secreto_super_seguro";
 
-const USERS_FILE = path.join(process.cwd(), "users.json");
-const FILES_FILE = path.join(process.cwd(), "files.json");
-const JWT_SECRET = process.env.JWT_SECRET || "secreto";
-
-function readJSON(file) { if (!fs.existsSync(file)) return []; return JSON.parse(fs.readFileSync(file)); }
-function writeJSON(file, data) { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
-
-// --- MODIFICACIÓN AQUÍ ---
-// Ahora este middleware busca el token en el Header O en la URL (?token=...)
+// --- MIDDLEWARE DE AUTH ---
+// Busca el token en Header O en la URL (para ver videos)
 function authMiddleware(req, res, next) {
-  const token = req.headers["authorization"]?.split("Bearer ")[1] || req.query.token;
+    const token = req.headers["authorization"]?.split("Bearer ")[1] || req.query.token;
+    if (!token) return res.status(401).json({ error: "No auth" });
   
-  if (!token) return res.status(401).json({ error: "No auth" });
-  
-  try { 
-      req.user = jwt.verify(token, JWT_SECRET); 
-      next(); 
-  } catch { 
-      res.status(401).json({ error: "Token bad" }); 
-  }
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        req.user = decoded; 
+        next();
+    } catch (err) {
+        res.status(401).json({ error: "Token inválido" });
+    }
 }
-// -------------------------
+
+// --- RUTAS ---
 
 app.post("/register", async (req, res) => {
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: "Datos faltantes" });
-    const users = readJSON(USERS_FILE);
-    if (users.find(u => u.email === email)) return res.status(400).json({ error: "Existe" });
-    const hash = await bcrypt.hash(password, 10);
-    users.push({ id: Date.now(), email, password: hash });
-    writeJSON(USERS_FILE, users);
-    res.json({ ok: true });
+    if (!email || !password) return res.status(400).json({ error: "Faltan datos" });
+
+    try {
+        // 1. Verificar si existe
+        const { data: existing } = await supabase.from('users').select('*').eq('email', email).single();
+        if (existing) return res.status(400).json({ error: "El correo ya está registrado" });
+
+        // 2. Crear usuario
+        const hash = await bcrypt.hash(password, 10);
+        const { error } = await supabase.from('users').insert([{ email, password: hash }]);
+        
+        if (error) throw error;
+        res.json({ ok: true, message: "Usuario creado" });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: "Error al registrar" });
+    }
 });
 
 app.post("/login", async (req, res) => {
     const { email, password } = req.body;
-    const users = readJSON(USERS_FILE);
-    const user = users.find(u => u.email === email);
-    if (!user || !await bcrypt.compare(password, user.password)) return res.status(400).json({ error: "Credenciales mal" });
-    res.json({ ok: true, token: jwt.sign({ id: user.id, email: user.email }, JWT_SECRET) });
-});
-
-// 🚀 RUTA DE SUBIDA INTELIGENTE (Video Stream + Miniatura Buffer)
-app.post("/upload", authMiddleware, (req, res) => {
-  const bb = busboy({ headers: req.headers });
-  
-  let videoUploadPromise = null;
-  let thumbUploadPromise = Promise.resolve(null); 
-
-  let fileName = "";
-  let mimeType = "";
-
-  bb.on('file', (name, file, info) => {
-    const { filename, mimeType: mime } = info;
-
-    if (name === "thumbnail") {
-        console.log("📸 Recibiendo miniatura...");
-        const chunks = [];
-        file.on('data', (chunk) => chunks.push(chunk));
-        file.on('end', () => {
-            const buffer = Buffer.concat(chunks);
-            thumbUploadPromise = uploadThumbnailBuffer(buffer)
-                .catch(err => {
-                    console.error("Error subiendo miniatura:", err);
-                    return null; 
-                });
-        });
-
-    } else if (name === "file") {
-        console.log(`📥 Recibiendo video: ${filename}`);
-        fileName = filename;
-        mimeType = mime;
-        const fileSize = parseInt(req.headers['content-length'] || "0");
-        
-        videoUploadPromise = uploadFromStream(file, filename, fileSize);
-    } else {
-        file.resume(); 
-    }
-  });
-
-  bb.on('close', async () => {
-    if (!videoUploadPromise) {
-        return res.status(400).json({ error: "No se envió el archivo de video ('file')" });
-    }
-
+    
     try {
-        const [videoResult, thumbId] = await Promise.all([videoUploadPromise, thumbUploadPromise]);
+        // 1. Buscar usuario en Supabase
+        const { data: user, error } = await supabase.from('users').select('*').eq('email', email).single();
+        
+        if (error || !user || !await bcrypt.compare(password, user.password)) {
+            return res.status(400).json({ error: "Credenciales incorrectas" });
+        }
 
-        const files = readJSON(FILES_FILE);
-        files.push({
-            id: Date.now(),
-            user_id: req.user.id,
-            name: fileName,
-            mime: mimeType,
-            thumbnail_id: thumbId,
-            telegram_id: videoResult.telegram_id,
-            message_id: videoResult.message_id,
-            created_at: new Date()
-        });
-        writeJSON(FILES_FILE, files);
-
-        res.json({ ok: true, message: "Video y Miniatura subidos correctamente" });
-    } catch (err) {
-        console.error("Error finalizando subida:", err);
-        if (!res.headersSent) res.status(500).json({ error: err.message });
+        // 2. Generar token
+        const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET);
+        res.json({ ok: true, token });
+    } catch (error) {
+        res.status(500).json({ error: "Error en login" });
     }
-  });
-
-  req.pipe(bb);
 });
 
-app.get("/files", authMiddleware, (req, res) => {
-    const files = readJSON(FILES_FILE).filter(f => f.user_id === req.user.id);
-    res.json(files);
+app.post("/upload", authMiddleware, (req, res) => {
+    const bb = busboy({ headers: req.headers });
+    let videoUploadPromise = null;
+    let thumbUploadPromise = Promise.resolve(null);
+    let fileName = "";
+    let mimeType = "";
+
+    bb.on('file', (name, file, info) => {
+        const { filename, mimeType: mime } = info;
+
+        if (name === "thumbnail") {
+            const chunks = [];
+            file.on('data', chunk => chunks.push(chunk));
+            file.on('end', () => {
+                thumbUploadPromise = uploadThumbnailBuffer(Buffer.concat(chunks)).catch(e => null);
+            });
+        } else if (name === "file") {
+            fileName = filename;
+            mimeType = mime;
+            const fileSize = parseInt(req.headers['content-length'] || "0");
+            videoUploadPromise = uploadFromStream(file, filename, fileSize);
+        } else {
+            file.resume();
+        }
+    });
+
+    bb.on('close', async () => {
+        if (!videoUploadPromise) return res.status(400).json({ error: "Falta el video" });
+
+        try {
+            const [videoResult, thumbId] = await Promise.all([videoUploadPromise, thumbUploadPromise]);
+
+            // Guardar registro en Supabase
+            const { error } = await supabase.from('files').insert([{
+                user_id: req.user.id,
+                name: fileName,
+                mime: mimeType,
+                thumbnail_id: thumbId,
+                telegram_id: videoResult.telegram_id,
+                message_id: videoResult.message_id
+            }]);
+
+            if (error) throw error;
+
+            res.json({ ok: true, message: "Subido exitosamente" });
+        } catch (err) {
+            console.error(err);
+            if (!res.headersSent) res.status(500).json({ error: err.message });
+        }
+    });
+
+    req.pipe(bb);
 });
-  
+
+app.get("/files", authMiddleware, async (req, res) => {
+    try {
+        // Obtener archivos del usuario desde Supabase
+        const { data: files, error } = await supabase
+            .from('files')
+            .select('*')
+            .eq('user_id', req.user.id)
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        res.json(files);
+    } catch (error) {
+        res.status(500).json({ error: "Error al obtener archivos" });
+    }
+});
+
 app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     try {
-        const url = await getFileUrl(req.params.file_id); 
+        const url = await getFileUrl(req.params.file_id);
         res.json({ url });
     } catch (error) {
-        res.status(500).json({ error: "Error URL" });
+        res.status(500).json({ error: "Error obteniendo URL" });
     }
 });
-  
+
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
-        const fileData = readJSON(FILES_FILE).find(f => f.message_id == req.params.message_id);
+        // Buscar metadatos en Supabase para saber el MIME type
+        const { data: fileData } = await supabase
+            .from('files')
+            .select('mime')
+            .eq('message_id', req.params.message_id)
+            .single();
+
         if (fileData) res.setHeader('Content-Type', fileData.mime);
+        
         await streamFile(req.params.message_id, res);
     } catch (error) {
+        console.error(error);
         if (!res.headersSent) res.status(500).end();
     }
 });
