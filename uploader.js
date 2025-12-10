@@ -20,28 +20,23 @@ async function initClient() {
     await clientPromise;
 }
 
-// --- SUBIDA BLINDADA (SOLUCIÓN AL ERROR DE PART_SIZE) ---
+// --- SUBIDA BLINDADA ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
-    const PART_SIZE = 512 * 1024; // 512KB (Regla estricta de Telegram)
+    const PART_SIZE = 512 * 1024; // 512KB
     const totalParts = fileSize > 0 ? Math.ceil(fileSize / PART_SIZE) : -1;
 
-    console.log(`🌊 Subiendo: ${fileName} (${fileSize} bytes) | Partes estimadas: ${totalParts}`);
+    console.log(`🌊 Subiendo: ${fileName} (${fileSize} bytes)`);
     
     let partIndex = 0;
     let buffer = Buffer.alloc(0);
 
-    // USAMOS 'FOR AWAIT' PARA EVITAR CONDICIONES DE CARRERA
-    // Esto garantiza que procesamos los datos en orden perfecto.
     for await (const chunk of stream) {
         buffer = Buffer.concat([buffer, chunk]);
-        
-        // Mientras tengamos suficiente para un bloque de 512KB, subimos
         while (buffer.length >= PART_SIZE) {
             const chunkToSend = buffer.slice(0, PART_SIZE);
             buffer = buffer.slice(PART_SIZE);
-            
             try {
                 await client.invoke(new Api.upload.SaveBigFilePart({
                     fileId: fileId,
@@ -50,14 +45,10 @@ export async function uploadFromStream(stream, fileName, fileSize) {
                     bytes: chunkToSend
                 }));
                 partIndex++;
-            } catch (err) {
-                console.error(`❌ Error subiendo parte ${partIndex}:`, err);
-                throw err; // Detener si falla
-            }
+            } catch (err) { throw err; }
         }
     }
 
-    // Subir el remanente final (si queda algo)
     if (buffer.length > 0) {
         await client.invoke(new Api.upload.SaveBigFilePart({
             fileId: fileId,
@@ -68,20 +59,8 @@ export async function uploadFromStream(stream, fileName, fileSize) {
         partIndex++;
     }
 
-    console.log(`✅ Subida de partes finalizada (${partIndex} partes). Generando archivo...`);
-
-    // Finalizar y crear el archivo en el chat
-    const inputFile = new Api.InputFileBig({
-        id: fileId,
-        parts: partIndex,
-        name: fileName
-    });
-
-    const res = await client.sendFile(chatId, {
-        file: inputFile,
-        forceDocument: true,
-        caption: fileName
-    });
+    const inputFile = new Api.InputFileBig({ id: fileId, parts: partIndex, name: fileName });
+    const res = await client.sendFile(chatId, { file: inputFile, forceDocument: true, caption: fileName });
 
     return { 
         telegram_id: await getTelegramFileId(res.id, chatId), 
@@ -89,11 +68,11 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     };
 }
 
-// --- VISUALIZACIÓN MANUAL (SIN CAMBIOS, YA FUNCIONABA) ---
-export async function streamFile(messageId, res) {
+// --- VISUALIZACIÓN INTELIGENTE (STREAMING CON RANGOS) ---
+export async function streamFile(messageId, res, range) {
     await initClient();
-    console.log(`🔍 Stream ID: ${messageId}`);
-
+    
+    // 1. Obtener metadatos reales de Telegram
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
     if (!msgs || !msgs[0]) throw new Error("Mensaje no encontrado");
     const msg = msgs[0];
@@ -102,11 +81,10 @@ export async function streamFile(messageId, res) {
     let fileSize = 0;
     let mimeType = "application/octet-stream";
 
-    // Extracción manual segura
     if (msg.media) {
         if (msg.media.document) {
             const doc = msg.media.document;
-            fileSize = doc.size;
+            fileSize = Number(doc.size);
             mimeType = doc.mimeType;
             location = new Api.InputDocumentFileLocation({
                 id: doc.id,
@@ -130,33 +108,68 @@ export async function streamFile(messageId, res) {
 
     if (!location) throw new Error("Sin archivo válido");
 
-    res.setHeader("Content-Type", mimeType);
-    res.setHeader("Content-Length", fileSize);
-    
-    console.log(`▶️ Descargando bytes directos (${fileSize})...`);
+    // 2. LÓGICA DE STREAMING
+    if (range) {
+        // El navegador pide una parte especifica (videos grandes/avance)
+        const parts = range.replace(/bytes=/, "").split("-");
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+        const chunksize = (end - start) + 1;
 
-    const CHUNK_SIZE = 512 * 1024; // Pedimos bloques de 512KB
-    let offset = BigInt(0);
-    
+        console.log(`✂️ Stream Parcial: ${start}-${end} (${mimeType})`);
+
+        res.writeHead(206, {
+            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': chunksize,
+            'Content-Type': mimeType,
+        });
+
+        await streamChunksToRes(location, res, start, end);
+    } else {
+        // El navegador pide todo (archivos pequeños)
+        console.log(`⬇️ Descarga Completa: ${fileSize} bytes`);
+        res.writeHead(200, {
+            'Content-Length': fileSize,
+            'Content-Type': mimeType,
+        });
+        await streamChunksToRes(location, res, 0, fileSize - 1);
+    }
+}
+
+// Función auxiliar para descargar y enviar bytes
+async function streamChunksToRes(location, res, startByte, endByte) {
+    let offset = BigInt(startByte);
+    const end = BigInt(endByte);
+    const KB = 1024 * 1024; // Pedimos bloques de 1MB para mayor velocidad
+
     try {
-        while (true) {
+        while (offset <= end) {
+            // Calculamos límite seguro
+            let limit = BigInt(KB);
+            if (offset + limit > end) {
+                limit = end - offset + 1n;
+            }
+
+            // Petición a Telegram
             const result = await client.invoke(new Api.upload.GetFile({
                 location: location,
                 offset: offset,
-                limit: CHUNK_SIZE
+                limit: Number(limit)
             }));
 
             if (!result || result.bytes.length === 0) break;
 
+            // Enviar al cliente
             res.write(result.bytes);
-            offset = offset + BigInt(result.bytes.length);
+            offset += BigInt(result.bytes.length);
 
-            if (result.bytes.length < CHUNK_SIZE) break;
+            // Si el cliente cierra la conexión (pausa video, cierra pestaña), abortamos
+            if (res.writableEnded || res.closed) break;
         }
-        res.end();
-        console.log("✅ Stream OK");
+        if (!res.writableEnded) res.end();
     } catch (err) {
-        console.error("❌ Error Stream:", err);
+        console.error("❌ Error Stream Pipe:", err);
         if (!res.writableEnded) res.end();
     }
 }
