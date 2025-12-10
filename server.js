@@ -1,41 +1,35 @@
 import express from "express";
-import multer from "multer";
 import cors from "cors";
 import fs from "fs";
 import path from "path";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-// Importar funciones de uploader.js, incluyendo streamFile
-import { uploadToTelegram, uploadThumbnail, getFileUrl, streamFile } from "./uploader.js"; 
-// Importar funciones de thumbnailer.js (asumo que thumbnailer.js existe y funciona)
-import { generateThumbnail, cleanupThumbnail } from "./thumbnailer.js"; 
+import busboy from "busboy"; // <--- NUEVO: Para manejar streams
+// Importamos la nueva función uploadFromStream y las existentes
+import { uploadFromStream, getFileUrl, streamFile } from "./uploader.js"; 
 
 const app = express();
-// Configura el CORS con tu URL de Netlify
-app.use(cors({ origin: "https://snapcloud.netlify.app" })); 
+
+// Configuración de CORS
+// IMPORTANTE: Agrega tu URL local para pruebas y la de Netlify
+const allowedOrigins = ["https://snapcloud.netlify.app", "http://localhost:5173", "http://localhost:3000"];
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) callback(null, true);
+    else callback(new Error('No permitido por CORS'));
+  }
+}));
+
 app.use(express.json());
 
-// Carpeta para uploads temporales
-const uploadDir = path.join(process.cwd(), "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-
-// Configuración multer
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: uploadDir,
-    filename: (req, file, cb) => cb(null, Date.now() + "_" + file.originalname)
-  }),
-  limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
-});
-
-// Archivos JSON (Recuerda: ¡Son volátiles en Render!)
+// Archivos JSON (Base de datos temporal)
 const USERS_FILE = path.join(process.cwd(), "users.json");
 const FILES_FILE = path.join(process.cwd(), "files.json");
 
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || "clave_super_secreta";
 
-// Leer/guardar JSON
+// --- FUNCIONES AUXILIARES DE "BASE DE DATOS" ---
 function readJSON(file) {
   if (!fs.existsSync(file)) return [];
   try {
@@ -45,11 +39,12 @@ function readJSON(file) {
     return [];
   }
 }
+
 function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-// Middleware de autenticación
+// --- MIDDLEWARE DE AUTENTICACIÓN ---
 function authMiddleware(req, res, next) {
   const token = req.headers["authorization"]?.split("Bearer ")[1];
   if (!token) return res.status(401).json({ error: "No autorizado" });
@@ -63,16 +58,21 @@ function authMiddleware(req, res, next) {
   }
 }
 
+// --- RUTAS DE USUARIO ---
+
 // Registro
 app.post("/register", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email y password son requeridos" });
+  
   const users = readJSON(USERS_FILE);
   if (users.find(u => u.email === email)) return res.status(400).json({ error: "Usuario ya existe" });
+  
   const hash = await bcrypt.hash(password, 10);
   const newUser = { id: Date.now(), email, password: hash };
   users.push(newUser);
   writeJSON(USERS_FILE, users);
+  
   res.json({ ok: true, message: "Usuario registrado" });
 });
 
@@ -81,64 +81,87 @@ app.post("/login", async (req, res) => {
   const { email, password } = req.body;
   const users = readJSON(USERS_FILE);
   const user = users.find(u => u.email === email);
+  
   if (!user) return res.status(400).json({ error: "Usuario no encontrado" });
+  
   const match = await bcrypt.compare(password, user.password);
   if (!match) return res.status(400).json({ error: "Password incorrecto" });
+  
   const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
   res.json({ ok: true, token });
 });
 
 
-// 🚀 RUTA DE SUBIDA (Actualizada para guardar message_id) 🚀
-app.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
-  let thumbPath = null;
-  
-  try {
-    if (!req.file) return res.status(400).json({ error: "No file provided" });
+// 🚀 RUTA DE SUBIDA MODIFICADA (STREAMING PURO) 🚀
+// Ya no usamos 'upload.single', usamos 'busboy' dentro de la ruta
+app.post("/upload", authMiddleware, (req, res) => {
+  const bb = busboy({ headers: req.headers });
+  let uploadPromise = null;
+  let fileReceived = false;
 
-    // PASO 1: Generar la miniatura
-    thumbPath = await generateThumbnail(req.file);
-
-    // PASO 2: Subir la miniatura 
-    const thumbnailResult = await uploadThumbnail(thumbPath); 
-    const thumbnailId = thumbnailResult.telegram_id; 
+  // Evento cuando Busboy detecta un archivo en el formulario
+  bb.on('file', (name, file, info) => {
+    fileReceived = true;
+    const { filename, mimeType } = info;
     
-    if (!thumbnailId) throw new Error("No se pudo obtener el ID del archivo de la miniatura.");
+    // Intentamos obtener el tamaño del header (es un estimado)
+    const fileSize = parseInt(req.headers['content-length'] || "0"); 
 
-    // 🚀 PASO 3: Subir el archivo original
-    const originalResult = await uploadToTelegram(req.file);
-    const originalId = originalResult.telegram_id; 
-    const messageId = originalResult.message_id; // <-- ID de mensaje para streaming
+    console.log(`📥 Recibiendo stream de archivo: ${filename}`);
 
-    if (!originalId) throw new Error("No se pudo obtener el ID del archivo original.");
+    // Llamamos a la función de uploader.js que conecta el stream con Telegram
+    uploadPromise = uploadFromStream(file, filename, fileSize)
+      .then(async (result) => {
+         // Cuando termina de subir, guardamos los datos
+         const files = readJSON(FILES_FILE);
+         files.push({
+           id: Date.now(),
+           user_id: req.user.id,
+           name: filename,
+           mime: mimeType,
+           thumbnail_id: null, // Sin miniatura en modo streaming puro
+           telegram_id: result.telegram_id,
+           message_id: result.message_id, // ID importante para ver el video después
+           created_at: new Date()
+         });
+         writeJSON(FILES_FILE, files);
+         return result;
+      })
+      .catch(err => {
+        console.error("Error crítico en el stream:", err);
+        throw err; // Lanzar para que lo capture el bb.on('close') o el manejador global
+      });
+  });
 
-    // PASO 4: Guardar metadata y limpiar
-    const files = readJSON(FILES_FILE);
-    files.push({
-      id: Date.now(),
-      user_id: req.user.id,
-      name: req.file.originalname,
-      mime: req.file.mimetype,
-      thumbnail_id: thumbnailId,   // ID de Bot API (largo)
-      telegram_id: originalId,     // ID de Bot API (largo)
-      message_id: messageId,       // ID de Mensaje (corto) - CRUCIAL PARA STREAMING
-      created_at: new Date()
-    });
-    writeJSON(FILES_FILE, files);
-    
-    // Limpiar archivos locales
-    fs.unlinkSync(req.file.path);
-    cleanupThumbnail(thumbPath);
+  // Evento cuando Busboy termina de procesar todo el formulario
+  bb.on('close', async () => {
+    if (!fileReceived) {
+      return res.status(400).json({ error: "No se envió ningún archivo" });
+    }
 
-    res.json({ ok: true, message: "Archivo subido correctamente" });
-  } catch (err) {
-    console.error("Error en /upload:", err);
-    // Asegurar limpieza en caso de error
-    if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-    if (thumbPath && fs.existsSync(thumbPath)) cleanupThumbnail(thumbPath);
-    res.status(500).json({ error: err.message || "Error subiendo archivo" });
-  }
+    if (uploadPromise) {
+      try {
+        await uploadPromise; // Esperamos a que termine la subida a Telegram
+        res.json({ ok: true, message: "Archivo subido exitosamente (Stream Directo)" });
+      } catch (err) {
+        res.status(500).json({ error: err.message || "Error durante la subida" });
+      }
+    }
+  });
+
+  // Manejo de errores de Busboy
+  bb.on('error', (err) => {
+      console.error('Error en Busboy:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Error procesando la carga" });
+      }
+  });
+
+  // Conectar el flujo de la petición HTTP a Busboy
+  req.pipe(bb);
 });
+
+// --- OTRAS RUTAS ---
 
 // Listar archivos del usuario
 app.get("/files", authMiddleware, (req, res) => {
@@ -146,7 +169,7 @@ app.get("/files", authMiddleware, (req, res) => {
   res.json(files);
 });
 
-// Ruta 🖼️: Obtener URL de la CDN de Telegram (Solo archivos pequeños/miniaturas)
+// Obtener URL de descarga directa (CDN Telegram) - Solo archivos pequeños
 app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     try {
         const fileId = req.params.file_id;
@@ -154,31 +177,30 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
         res.json({ url });
     } catch (error) {
         console.error("Error en /file-url:", error.message);
-        res.status(500).json({ error: error.message || "Error al obtener la URL del archivo de Telegram" });
+        res.status(500).json({ error: error.message || "Error al obtener URL" });
     }
 });
 
-// 🎥 NUEVA RUTA: Streaming de archivos grandes (Usa el Cliente de Usuario)
+// Streaming de descarga (Ver videos grandes)
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
         const messageId = req.params.message_id;
 
-        // 1. Buscar metadata para obtener el MIME type
         const files = readJSON(FILES_FILE);
         const fileData = files.find(f => f.message_id == messageId);
 
         if (!fileData) {
-            return res.status(404).json({ error: "Archivo no encontrado" });
+            return res.status(404).json({ error: "Archivo no encontrado en base de datos" });
         }
         
-        // 2. Establecer el Content-Type para el navegador
+        // Headers para que el navegador sepa que es un video/archivo
         res.setHeader('Content-Type', fileData.mime);
+        // Opcional: Content-Disposition para forzar descarga o nombre
+        // res.setHeader('Content-Disposition', `inline; filename="${fileData.name}"`);
 
-        // 3. Iniciar el streaming usando el cliente de usuario (sin límite de 20MB)
         await streamFile(messageId, res);
     } catch (error) {
-        console.error("Error en streaming:", error.message);
-        // Si la conexión se cerró antes de enviar los headers, simplemente terminamos.
+        console.error("Error en streaming descarga:", error.message);
         if (!res.headersSent) {
             res.status(500).json({ error: "Error en el streaming del archivo" });
         } else {
@@ -187,6 +209,6 @@ app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     }
 });
 
-// Servidor
+// Iniciar servidor
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor iniciado en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor SnapCloud iniciado en puerto ${PORT}`));
