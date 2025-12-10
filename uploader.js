@@ -19,7 +19,7 @@ async function initClient() {
     await clientPromise;
 }
 
-// --- SUBIDA (UPLOAD) - SIN CAMBIOS ---
+// --- SUBIDA (UPLOAD) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
@@ -61,63 +61,7 @@ export async function uploadThumbnailBuffer(buffer) {
     return await getTelegramFileId(res.id, botChatId);
 }
 
-// --- VISUALIZACIÓN (STREAMING) ---
-export async function streamFile(messageId, res) {
-    await initClient();
-    console.log(`🔍 Buscando ID: ${messageId}`);
-
-    const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
-    if (!msgs || msgs.length === 0 || !msgs[0]) {
-        throw new Error("Mensaje no encontrado.");
-    }
-    
-    const msg = msgs[0];
-
-    // --- SOLUCIÓN DEL ERROR "CANNOT CAST" ---
-    // En lugar de construir la ubicación manualmente, extraemos el objeto Documento/Foto real.
-    // GramJS sabe cómo descargar estos objetos nativos.
-    let mediaToDownload = null;
-
-    if (msg.media) {
-        if (msg.media.document) {
-            // Es un video o archivo. Extraemos el objeto 'Document' puro.
-            console.log("📂 Detectado: Documento");
-            mediaToDownload = msg.media.document;
-        } else if (msg.media.photo) {
-            // Es una foto. Extraemos el objeto 'Photo' puro.
-            console.log("📸 Detectado: Foto");
-            mediaToDownload = msg.media.photo;
-        } else {
-            // Fallback: intentamos usar el media wrapper si no es ninguno de los anteriores
-            mediaToDownload = msg.media;
-        }
-    }
-
-    if (!mediaToDownload) {
-        throw new Error("El mensaje no tiene un archivo válido (mediaToDownload es null).");
-    }
-
-    console.log("▶️ Transmitiendo al visor...");
-
-    try {
-        const stream = client.iterDownload(mediaToDownload, { 
-            chunkSize: 64 * 1024, 
-            // Pasamos el dcId si está disponible para ayudar a la librería a encontrar el servidor
-            dcId: mediaToDownload.dcId || null 
-        });
-
-        for await (const chunk of stream) {
-            res.write(chunk);
-        }
-        res.end();
-        console.log("✅ Stream finalizado.");
-    } catch (err) {
-        console.error("❌ Error interno iterDownload:", err);
-        throw err;
-    }
-}
-
-// --- UTILIDADES ---
+// --- OBTENER URL (REPARADO) ---
 export async function getFileUrl(fileId) {
     if (!BOT_TOKEN) return null;
     try {
@@ -128,6 +72,50 @@ export async function getFileUrl(fileId) {
     return null;
 }
 
+// --- VISUALIZACIÓN (REPARADO) ---
+export async function streamFile(messageId, res) {
+    await initClient();
+    console.log(`🔍 Buscando ID para stream: ${messageId}`);
+
+    const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
+    if (!msgs || !msgs[0]) throw new Error("Mensaje no encontrado");
+    
+    const msg = msgs[0];
+
+    // Lógica para extraer el archivo real (Documento o Foto)
+    // Esto evita el error "Cannot cast undefined"
+    let mediaToDownload = null;
+
+    if (msg.media) {
+        if (msg.media.document) {
+            mediaToDownload = msg.media.document;
+        } else if (msg.media.photo) {
+            mediaToDownload = msg.media.photo;
+        } else {
+            mediaToDownload = msg.media;
+        }
+    }
+
+    if (!mediaToDownload) throw new Error("No hay media en el mensaje");
+
+    try {
+        const stream = client.iterDownload(mediaToDownload, { 
+            chunkSize: 64 * 1024,
+            dcId: mediaToDownload.dcId || null
+        });
+
+        for await (const chunk of stream) {
+            res.write(chunk);
+        }
+        res.end();
+        console.log("✅ Visualización completada.");
+    } catch (err) {
+        console.error("❌ Error interno iterDownload:", err);
+        throw err;
+    }
+}
+
+// Helper interno
 async function getTelegramFileId(msgId, chId) {
     if(!BOT_TOKEN) return null;
     try {
