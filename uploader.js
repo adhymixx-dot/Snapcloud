@@ -8,14 +8,15 @@ function getRequiredEnv(varName) {
     return value;
 }
 
+// Configuración
 const apiId = Number(getRequiredEnv("TELEGRAM_API_ID"));
 const apiHash = getRequiredEnv("TELEGRAM_API_HASH");
 const sessionString = getRequiredEnv("TELEGRAM_SESSION");
-// Aseguramos que el ID del canal se lea correctamente como BigInt (incluso si es negativo)
 const chatId = BigInt(getRequiredEnv("TELEGRAM_CHANNEL_ID")); 
 const botChatId = BigInt(process.env.BOT_CHANNEL_ID || chatId); 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
+// Cliente
 const session = new StringSession(sessionString);
 const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
 
@@ -27,10 +28,6 @@ async function initClient() {
         clientPromise = client.connect();
     }
     await clientPromise;
-    // Verificación rápida de que estamos logueados
-    if(!await client.checkAuthorization()) {
-        throw new Error("❌ LA SESIÓN DE TELEGRAM HA EXPIRADO. Genera una nueva.");
-    }
 }
 
 // --- SUBIDA (UPLOAD) ---
@@ -75,7 +72,6 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     const inputFile = new Api.InputFileBig({ id: fileId, parts: partIndex + 1, name: fileName });
     const messageResult = await client.sendFile(chatId, { file: inputFile, caption: "SnapCloud File", forceDocument: true });
     
-    // Obtenemos el ID compatible
     const finalFileId = await getTelegramFileId(messageResult.id, chatId);
     return { telegram_id: finalFileId, message_id: messageResult.id };
 }
@@ -130,40 +126,64 @@ export async function getFileUrl(fileId) {
     } catch (e) { return null; }
 }
 
-// --- STREAMING (AQUÍ ESTABA EL ERROR) ---
+// --- STREAMING (FIX DEFINITIVO) ---
 export async function streamFile(messageId, res) {
     await initClient();
     
-    console.log(`🔍 Buscando mensaje ID: ${messageId} en canal: ${chatId}`);
+    console.log(`🔍 Buscando mensaje ID: ${messageId}`);
 
-    // Obtenemos el mensaje
+    // 1. Obtener mensaje
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
     
     if (!msgs || msgs.length === 0 || !msgs[0]) {
-        throw new Error("Mensaje no encontrado en Telegram (puede haber sido borrado).");
+        throw new Error("Mensaje no encontrado (puede haber sido borrado).");
     }
     
     const msg = msgs[0];
 
-    // Verificamos si es un mensaje vacío (pasa a veces si no hay acceso)
-    if (!msg.media && !msg.document && !msg.photo) {
-        console.log("Dump del mensaje:", msg); // Para ver en logs qué llegó
-        throw new Error("El mensaje existe pero no tiene media o no es accesible.");
+    // 2. Extraer el objeto EXACTO que GramJS necesita (Documento o Foto)
+    // Esto evita el error "Cannot cast [object Object]"
+    let mediaObject = null;
+
+    if (msg.media) {
+        if (msg.media.document) {
+            console.log("📂 Tipo: Documento/Video");
+            mediaObject = msg.media.document;
+        } else if (msg.media.photo) {
+            console.log("📸 Tipo: Foto");
+            mediaObject = msg.media.photo;
+        } else {
+            // Caso raro: a veces el media es directo si no tiene wrapper
+            mediaObject = msg.media;
+        }
     }
 
-    // CORRECCIÓN: Pasamos 'msg' (el objeto entero), NO 'msg.media'
-    // Esto permite a GramJS saber de qué chat descargar el archivo.
-    const stream = client.iterDownload(msg, { 
-        chunkSize: 64 * 1024, // Ajustado para ser más estable
-    });
-    
-    res.on('close', () => {
-        console.log("Cliente cerró conexión, deteniendo stream.");
+    if (!mediaObject) {
+        console.log("Dump msg:", msg);
+        throw new Error("No se encontró archivo adjunto válido en el mensaje.");
+    }
+
+    console.log(`⬇️ Iniciando descarga...`);
+
+    try {
+        // 3. Descargar usando el objeto extraído
+        const stream = client.iterDownload(mediaObject, { 
+            chunkSize: 64 * 1024, // 64KB
+        });
+        
+        res.on('close', () => {
+            console.log("Cliente cerró conexión.");
+            res.end();
+        });
+
+        for await (const chunk of stream) {
+            res.write(chunk);
+        }
         res.end();
-    });
+        console.log("✅ Stream finalizado.");
 
-    for await (const chunk of stream) {
-        res.write(chunk);
+    } catch (err) {
+        console.error("❌ Error interno iterDownload:", err);
+        throw err;
     }
-    res.end();
 }
