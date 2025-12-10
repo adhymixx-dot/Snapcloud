@@ -20,7 +20,7 @@ async function initClient() {
     await clientPromise;
 }
 
-// --- SUBIDA (Igual que antes, funciona bien) ---
+// --- SUBIDA (SIN CAMBIOS) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
@@ -52,7 +52,6 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     const inputFile = new Api.InputFileBig({ id: fileId, parts: partIndex, name: fileName });
     const res = await client.sendFile(chatId, { file: inputFile, forceDocument: true, caption: fileName });
 
-    // Retornamos también el tamaño real para guardarlo en DB
     let realSize = 0;
     if(res.media && res.media.document) realSize = res.media.document.size;
 
@@ -63,16 +62,14 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     };
 }
 
-// --- VISUALIZACIÓN POR RANGOS (LA SOLUCIÓN DE VIDEO) ---
+// --- VISUALIZACIÓN POR RANGOS (CORREGIDO LIMIT_INVALID) ---
 export async function streamFile(messageId, res, startByte = 0, endByte = -1) {
     await initClient();
     
-    // Obtener mensaje
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
     if (!msgs || !msgs[0]) throw new Error("Msg no encontrado");
     const msg = msgs[0];
 
-    // Construir ubicación manual
     let location = null;
     let fileSize = 0;
 
@@ -91,37 +88,48 @@ export async function streamFile(messageId, res, startByte = 0, endByte = -1) {
 
     if (!location) throw new Error("Sin archivo");
 
-    // Lógica de Rangos
     if (endByte === -1 || endByte >= fileSize) endByte = fileSize - 1;
     
     let currentOffset = BigInt(startByte);
     const end = BigInt(endByte);
-    const CHUNK_SIZE = 1024 * 1024; // 1MB por petición a Telegram
+    const CHUNK_SIZE = 1024 * 1024; // 1MB estándar
 
     try {
-        // Bucle inteligente: Solo descarga lo necesario
         while (currentOffset <= end) {
-            // Calculamos cuánto pedir para no pasarnos del final solicitado
-            let limit = CHUNK_SIZE;
-            const remaining = end - currentOffset + 1n;
-            if (remaining < BigInt(limit)) limit = Number(remaining);
+            // 1. Calculamos cuánto necesitamos realmente
+            let needed = Number(end - currentOffset + 1n);
+            if (needed > CHUNK_SIZE) needed = CHUNK_SIZE;
 
+            // 2. CORRECCIÓN CRÍTICA: Ajustar a múltiplo de 4KB (4096)
+            // Telegram exige que 'limit' sea divisible por 4096.
+            let requestLimit = needed;
+            if (requestLimit % 4096 !== 0) {
+                // Redondeamos hacia arriba al múltiplo de 4096 más cercano
+                requestLimit = Math.ceil(needed / 4096) * 4096;
+            }
+
+            // 3. Pedimos a Telegram (con el limit corregido)
             const result = await client.invoke(new Api.upload.GetFile({
                 location: location,
                 offset: currentOffset,
-                limit: limit
+                limit: requestLimit 
             }));
 
             if (!result || result.bytes.length === 0) break;
 
-            // Enviamos al navegador
-            res.write(result.bytes);
+            // 4. Si pedimos más de lo necesario por el redondeo, cortamos el sobrante
+            // para no enviar basura al navegador.
+            let bytesToSend = result.bytes;
+            if (bytesToSend.length > needed) {
+                bytesToSend = bytesToSend.slice(0, needed);
+            }
+
+            res.write(bytesToSend);
             
-            // Avanzamos el offset
-            currentOffset += BigInt(result.bytes.length);
+            currentOffset += BigInt(bytesToSend.length);
             
-            // Seguridad para no loops infinitos
-            if (result.bytes.length < limit) break; 
+            // Si Telegram devolvió menos de lo que pedimos, es el fin del archivo
+            if (result.bytes.length < requestLimit) break; 
         }
         
         res.end();
