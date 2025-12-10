@@ -36,7 +36,7 @@ app.post("/register", async (req, res) => {
         const hash = await bcrypt.hash(password, 10);
         await supabase.from('users').insert([{ email, password: hash }]);
         res.json({ ok: true });
-    } catch (e) { res.status(500).json({ error: "Error en registro" }); }
+    } catch (e) { res.status(500).json({ error: "Error registro" }); }
 });
 
 app.post("/login", async (req, res) => {
@@ -46,7 +46,7 @@ app.post("/login", async (req, res) => {
         if (!user || !await bcrypt.compare(password, user.password)) return res.status(400).json({ error: "Credenciales inválidas" });
         const token = jwt.sign({ id: user.id }, JWT_SECRET);
         res.json({ ok: true, token });
-    } catch (e) { res.status(500).json({ error: "Error en login" }); }
+    } catch (e) { res.status(500).json({ error: "Error login" }); }
 });
 
 // --- SUBIDA ---
@@ -66,17 +66,20 @@ app.post("/upload", authMiddleware, (req, res) => {
     });
 
     bb.on('close', async () => {
-        if (!vidP) return res.status(400).json({ error: "Falta el archivo principal" });
+        if (!vidP) return res.status(400).json({ error: "Falta archivo" });
         try {
             const [vid, th] = await Promise.all([vidP, thP]);
             let tId = th ? (th.message_id || th) : null;
             if (typeof tId === 'object') tId = JSON.stringify(tId);
 
+            // Intentamos guardar el size, si existe
+            const sizeToSave = vid.file_size || null;
+
             await supabase.from('files').insert([{
                 user_id: req.user.id, name: fName, mime: mime,
                 thumbnail_id: tId ? String(tId) : null,
                 telegram_id: String(vid.telegram_id), message_id: String(vid.message_id),
-                size: vid.file_size // Guardamos el tamaño real (importante para rangos)
+                size: sizeToSave
             }]);
             res.json({ ok: true });
         } catch (e) { console.error(e); if(!res.headersSent) res.status(500).json({ error: e.message }); }
@@ -85,6 +88,7 @@ app.post("/upload", authMiddleware, (req, res) => {
 });
 
 app.get("/files", authMiddleware, async (req, res) => {
+    // Pedimos TODO (*) para evitar errores si falta alguna columna nueva
     const { data } = await supabase.from('files').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
     res.json(data);
 });
@@ -94,42 +98,38 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     res.json({ url });
 });
 
-// --- VISUALIZACIÓN INTELIGENTE (RANGES) ---
+// --- STREAMING (SOLUCIÓN ERROR 404) ---
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
-        // 1. Obtenemos datos del archivo desde Supabase
-        // Necesitamos el 'size' (tamaño) para que el navegador sepa cuánto dura el video
-        // Si tu tabla 'files' no tiene columna 'size', funcionará a medias, pero idealmente agrégala.
-        const { data: fileData } = await supabase.from('files').select('mime, name, size').eq('message_id', req.params.message_id).single();
+        // CORRECCIÓN: Usamos select('*') para que no falle si falta la columna 'size'
+        const { data: fileData, error } = await supabase.from('files').select('*').eq('message_id', req.params.message_id).single();
 
-        if (!fileData) return res.status(404).send("Archivo no encontrado");
+        if (error || !fileData) {
+            console.error("❌ Error DB buscando archivo:", error);
+            return res.status(404).send("Archivo no encontrado en DB");
+        }
 
-        const fileSize = fileData.size || 50 * 1024 * 1024; // Fallback 50MB si no hay dato
+        // CORRECCIÓN: Si el archivo es viejo y no tiene size, usamos un default grande (50MB)
+        // para que por lo menos empiece a reproducir sin crashear.
+        const fileSize = fileData.size || 50 * 1024 * 1024; 
         const range = req.headers.range;
 
-        // Configuración básica
         res.setHeader('Content-Type', fileData.mime);
         res.setHeader('Content-Disposition', `inline; filename="${fileData.name}"`);
         res.setHeader('Accept-Ranges', 'bytes');
 
         if (range) {
-            // El navegador pide una PARTE del video (ej: bytes=0-1048576)
             const parts = range.replace(/bytes=/, "").split("-");
             const start = parseInt(parts[0], 10);
             const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
             const chunksize = (end - start) + 1;
 
-            console.log(`📡 Stream Range: ${start} - ${end} (${chunksize} bytes)`);
-
-            res.status(206); // HTTP 206 Partial Content
+            res.status(206);
             res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
             res.setHeader('Content-Length', chunksize);
 
-            // Llamamos al uploader pidiendo solo esos bytes
             await streamFile(req.params.message_id, res, start, end);
         } else {
-            // El navegador pide TODO (raro en videos grandes)
-            console.log(`📡 Stream Completo: ${fileSize} bytes`);
             res.setHeader('Content-Length', fileSize);
             await streamFile(req.params.message_id, res, 0, fileSize - 1);
         }
@@ -141,4 +141,4 @@ app.get("/stream/:message_id", authMiddleware, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Servidor SnapCloud activo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor listo en puerto ${PORT}`));
