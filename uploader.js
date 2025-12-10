@@ -20,7 +20,7 @@ async function initClient() {
     await clientPromise;
 }
 
-// --- SUBIDA (SIN CAMBIOS) ---
+// --- SUBIDA (SIN CAMBIOS - FUNCIONA BIEN) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
@@ -62,7 +62,7 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     };
 }
 
-// --- VISUALIZACIÓN POR RANGOS (CORREGIDO LIMIT_INVALID) ---
+// --- VISUALIZACIÓN HÍBRIDA (LA SOLUCIÓN FINAL) ---
 export async function streamFile(messageId, res, startByte = 0, endByte = -1) {
     await initClient();
     
@@ -70,71 +70,104 @@ export async function streamFile(messageId, res, startByte = 0, endByte = -1) {
     if (!msgs || !msgs[0]) throw new Error("Msg no encontrado");
     const msg = msgs[0];
 
-    let location = null;
+    // 1. Detectar qué tenemos
+    let mediaObj = null;
     let fileSize = 0;
+    let isVideo = false;
 
     if (msg.media) {
         if (msg.media.document) {
-            const d = msg.media.document;
-            fileSize = d.size;
-            location = new Api.InputDocumentFileLocation({ id: d.id, accessHash: d.accessHash, fileReference: d.fileReference, thumbSize: "" });
+            mediaObj = msg.media.document;
+            fileSize = mediaObj.size;
+            // Si el mime type dice video, o pesa más de 10MB, lo tratamos como video
+            if (mediaObj.mimeType.startsWith('video') || fileSize > 10 * 1024 * 1024) {
+                isVideo = true;
+            }
         } else if (msg.media.photo) {
-            const p = msg.media.photo;
-            const sz = p.sizes[p.sizes.length - 1];
-            fileSize = sz.size;
-            location = new Api.InputPhotoFileLocation({ id: p.id, accessHash: p.accessHash, fileReference: p.fileReference, thumbSize: sz.type });
+            // Las fotos siempre son pequeñas y simples
+            mediaObj = msg.media.photo;
+            isVideo = false; 
         }
     }
 
-    if (!location) throw new Error("Sin archivo");
+    if (!mediaObj) throw new Error("Sin archivo");
+
+    // --- RUTA RÁPIDA (PARA FOTOS) ---
+    // Si NO es video (es foto o archivo pequeño), usamos el método simple de GramJS.
+    // Esto evita errores de alineación en archivos pequeños.
+    if (!isVideo) {
+        console.log("📸 Descargando Foto/Archivo simple...");
+        try {
+            // downloadMedia gestiona todo automáticamente para fotos
+            const buffer = await client.downloadMedia(msg.media, { workers: 1 });
+            res.write(buffer);
+            res.end();
+            console.log("✅ Foto enviada.");
+            return;
+        } catch (err) {
+            console.error("❌ Error bajando foto:", err);
+            // Si falla, dejamos que caiga al método manual de abajo por si acaso
+        }
+    }
+
+    // --- RUTA COMPLEJA (PARA VIDEOS / STREAMING) ---
+    console.log("🎥 Iniciando Streaming de Video...");
+    
+    // Construimos la ubicación manual
+    let location = null;
+    if (msg.media.document) {
+        const d = msg.media.document;
+        location = new Api.InputDocumentFileLocation({ id: d.id, accessHash: d.accessHash, fileReference: d.fileReference, thumbSize: "" });
+    } else if (msg.media.photo) {
+        // Fallback raro si una foto cayó aquí
+        const p = msg.media.photo;
+        const sz = p.sizes[p.sizes.length - 1];
+        location = new Api.InputPhotoFileLocation({ id: p.id, accessHash: p.accessHash, fileReference: p.fileReference, thumbSize: sz.type });
+    }
 
     if (endByte === -1 || endByte >= fileSize) endByte = fileSize - 1;
     
     let currentOffset = BigInt(startByte);
     const end = BigInt(endByte);
-    const CHUNK_SIZE = 1024 * 1024; // 1MB estándar
+    const CHUNK_SIZE = 1024 * 1024; // 1MB
 
     try {
         while (currentOffset <= end) {
-            // 1. Calculamos cuánto necesitamos realmente
+            // Lógica de alineación 4KB (Obligatoria para Telegram GetFile)
+            const alignment = 4096n;
+            const alignedOffset = currentOffset - (currentOffset % alignment);
+            const skipBytes = Number(currentOffset - alignedOffset); 
+
             let needed = Number(end - currentOffset + 1n);
             if (needed > CHUNK_SIZE) needed = CHUNK_SIZE;
 
-            // 2. CORRECCIÓN CRÍTICA: Ajustar a múltiplo de 4KB (4096)
-            // Telegram exige que 'limit' sea divisible por 4096.
-            let requestLimit = needed;
+            let rawLimit = skipBytes + needed;
+            let requestLimit = rawLimit;
+            
             if (requestLimit % 4096 !== 0) {
-                // Redondeamos hacia arriba al múltiplo de 4096 más cercano
-                requestLimit = Math.ceil(needed / 4096) * 4096;
+                requestLimit = Math.ceil(rawLimit / 4096) * 4096;
             }
 
-            // 3. Pedimos a Telegram (con el limit corregido)
             const result = await client.invoke(new Api.upload.GetFile({
                 location: location,
-                offset: currentOffset,
+                offset: alignedOffset,
                 limit: requestLimit 
             }));
 
             if (!result || result.bytes.length === 0) break;
 
-            // 4. Si pedimos más de lo necesario por el redondeo, cortamos el sobrante
-            // para no enviar basura al navegador.
-            let bytesToSend = result.bytes;
-            if (bytesToSend.length > needed) {
-                bytesToSend = bytesToSend.slice(0, needed);
-            }
+            let chunkBuffer = result.bytes;
+            if (skipBytes > 0) chunkBuffer = chunkBuffer.slice(skipBytes);
+            if (chunkBuffer.length > needed) chunkBuffer = chunkBuffer.slice(0, needed);
 
-            res.write(bytesToSend);
+            res.write(chunkBuffer);
+            currentOffset += BigInt(chunkBuffer.length);
             
-            currentOffset += BigInt(bytesToSend.length);
-            
-            // Si Telegram devolvió menos de lo que pedimos, es el fin del archivo
-            if (result.bytes.length < requestLimit) break; 
+            if (result.bytes.length < requestLimit) break;
         }
-        
         res.end();
     } catch (err) {
-        console.error("❌ Error Range Stream:", err);
+        console.error("❌ Error Stream Video:", err);
         if (!res.writableEnded) res.end();
     }
 }
