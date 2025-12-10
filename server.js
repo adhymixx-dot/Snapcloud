@@ -4,17 +4,14 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import busboy from "busboy";
 import { createClient } from "@supabase/supabase-js";
-// Asumimos que uploader.js maneja la lógica de Telegram
 import { uploadFromStream, uploadThumbnailBuffer, getFileUrl, streamFile } from "./uploader.js";
 
 const app = express();
-const allowedOrigins = ["https://snapcloud.netlify.app", "http://localhost:5173", "http://localhost:3000"];
 
+// Configuración CORS automática
 app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) callback(null, true);
-    else callback(new Error('No permitido por CORS'));
-  }
+    origin: "*", // Permitir todo para evitar bloqueos en pruebas
+    methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
 }));
 
 app.use(express.json());
@@ -26,13 +23,11 @@ const supabaseKey = process.env.SUPABASE_KEY;
 
 if (!supabaseUrl || !supabaseKey) {
     console.error("❌ ERROR: Faltan variables de SUPABASE en Render.");
-    process.exit(1);
 }
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 // --- MIDDLEWARE DE AUTH ---
 function authMiddleware(req, res, next) {
-    // Busca token en Header O en URL (para streaming directo)
     const token = req.headers["authorization"]?.split("Bearer ")[1] || req.query.token;
     if (!token) return res.status(401).json({ error: "No auth" });
   
@@ -80,7 +75,6 @@ app.post("/login", async (req, res) => {
     }
 });
 
-// 🚀 RUTA DE SUBIDA CORREGIDA
 app.post("/upload", authMiddleware, (req, res) => {
     const bb = busboy({ headers: req.headers });
     let videoUploadPromise = null;
@@ -92,7 +86,6 @@ app.post("/upload", authMiddleware, (req, res) => {
         const { filename, mimeType: mime } = info;
 
         if (name === "thumbnail") {
-            console.log("📸 Recibiendo miniatura...");
             const chunks = [];
             file.on('data', chunk => chunks.push(chunk));
             file.on('end', () => {
@@ -105,7 +98,6 @@ app.post("/upload", authMiddleware, (req, res) => {
                 }
             });
         } else if (name === "file") {
-            console.log(`📥 Recibiendo archivo principal: ${filename}`);
             fileName = filename;
             mimeType = mime;
             const fileSize = parseInt(req.headers['content-length'] || "0");
@@ -121,16 +113,12 @@ app.post("/upload", authMiddleware, (req, res) => {
         try {
             const [videoResult, thumbResult] = await Promise.all([videoUploadPromise, thumbUploadPromise]);
 
-            // --- CORRECCIÓN DE ID DE MINIATURA ---
             let cleanThumbId = null;
             if (thumbResult) {
-                // Si thumbResult es objeto (mensaje de Telegram), sacamos el ID. Si es string, lo usamos.
                 cleanThumbId = thumbResult.message_id || thumbResult;
-                // Nos aseguramos que sea string para la base de datos
                 if (typeof cleanThumbId === 'object') cleanThumbId = JSON.stringify(cleanThumbId);
             }
 
-            // Insertar en Supabase
             const { error } = await supabase.from('files').insert([{
                 user_id: req.user.id,
                 name: fileName,
@@ -141,7 +129,6 @@ app.post("/upload", authMiddleware, (req, res) => {
             }]);
 
             if (error) throw error;
-
             res.json({ ok: true, message: "Subido exitosamente" });
         } catch (err) {
             console.error(err);
@@ -178,18 +165,27 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
 
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
+        console.log(`📡 Solicitando stream para mensaje: ${req.params.message_id}`);
+        
         const { data: fileData } = await supabase
             .from('files')
             .select('mime')
             .eq('message_id', req.params.message_id)
             .single();
 
-        if (fileData) res.setHeader('Content-Type', fileData.mime);
+        if (fileData) {
+            res.setHeader('Content-Type', fileData.mime);
+        }
+
+        // Llamamos a la función de streaming
         await streamFile(req.params.message_id, res);
+        
     } catch (error) {
-        if (!res.headersSent) res.status(500).end();
+        // AQUÍ ESTÁ EL FIX: Imprimir el error real en Render
+        console.error("❌ ERROR CRÍTICO EN STREAMING:", error);
+        if (!res.headersSent) res.status(500).json({ error: error.message || "Error interno streaming" });
     }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor listo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor listo en puerto ${PORT}`));

@@ -2,77 +2,40 @@ import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 
 // --- VALIDACIÓN DE VARIABLES ---
-function getRequiredBigInt(varName) {
+function getRequiredEnv(varName) {
     const value = process.env[varName];
-    if (!value) {
-        throw new Error(`CRITICAL ERROR: Environment variable ${varName} is missing or empty.`);
-    }
-    return BigInt(value);
+    if (!value) throw new Error(`CRITICAL ERROR: Faltante ${varName}`);
+    return value;
 }
 
-// --- CONFIGURACIÓN ---
-const apiId = Number(process.env.TELEGRAM_API_ID);
-const apiHash = process.env.TELEGRAM_API_HASH;
-const chatId = getRequiredBigInt("TELEGRAM_CHANNEL_ID"); 
-const botChatId = getRequiredBigInt("BOT_CHANNEL_ID"); // <--- Asegúrate de tener esto en tu .env
+const apiId = Number(getRequiredEnv("TELEGRAM_API_ID"));
+const apiHash = getRequiredEnv("TELEGRAM_API_HASH");
+const sessionString = getRequiredEnv("TELEGRAM_SESSION");
+const chatId = BigInt(getRequiredEnv("TELEGRAM_CHANNEL_ID")); 
+const botChatId = BigInt(process.env.BOT_CHANNEL_ID || chatId); // Opcional, fallback al mismo
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
-// Cliente de Usuario (MTProto)
-const session = new StringSession(process.env.TELEGRAM_SESSION);
+const session = new StringSession(sessionString);
 const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
 
-let clientStarted = false;
+let clientPromise = null;
+
 async function initClient() {
-  if (clientStarted) return;
-  await client.connect();
-  clientStarted = true;
-  console.log("Telegram CLIENTE conectado.");
-}
-
-async function getTelegramFileId(messageId, channelIdBigInt) {
-    if (!BOT_TOKEN) throw new Error("BOT_TOKEN no configurado.");
-    const channelIdStr = channelIdBigInt.toString(); 
-    
-    // 1. Reenviar mensaje
-    const url = `https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`;
-    const params = { chat_id: channelIdStr, from_chat_id: channelIdStr, message_id: messageId };
-
-    try {
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(params)
-        });
-        const data = await response.json();
-        if (!data.ok) throw new Error(`Error Bot API: ${data.description}`);
-
-        const forwardedMsg = data.result;
-        let fileId = null;
-        if (forwardedMsg.document) fileId = forwardedMsg.document.file_id;
-        else if (forwardedMsg.video) fileId = forwardedMsg.video.file_id;
-        else if (forwardedMsg.photo) fileId = forwardedMsg.photo[forwardedMsg.photo.length - 1].file_id;
-
-        if (!fileId) throw new Error("No file_id found.");
-
-        // 2. Borrar mensaje
-        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: channelIdStr, message_id: forwardedMsg.message_id })
-        });
-
-        return fileId;
-    } catch (err) {
-        console.error("Fallo obteniendo file_id:", err);
-        throw err;
+    if (!clientPromise) {
+        console.log("🔌 Conectando a Telegram...");
+        clientPromise = client.connect();
+    }
+    await clientPromise;
+    // Verificación rápida de sesión
+    if(!await client.checkAuthorization()) {
+        throw new Error("❌ LA SESIÓN DE TELEGRAM HA EXPIRADO. Genera una nueva.");
     }
 }
 
-// --- EXPORTACIONES ---
-
+// --- SUBIDA ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
-    console.log(`🌊 Streaming: ${fileName}`);
+    console.log(`🌊 Subiendo stream: ${fileName}`);
     const fileId = BigInt(Date.now());
     const partSize = 512 * 1024; 
     const totalParts = fileSize > 0 ? Math.ceil(fileSize / partSize) : -1;
@@ -109,31 +72,55 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     });
 
     const inputFile = new Api.InputFileBig({ id: fileId, parts: partIndex + 1, name: fileName });
-    const messageResult = await client.sendFile(chatId, { file: inputFile, caption: "SnapCloud Video", forceDocument: true });
+    const messageResult = await client.sendFile(chatId, { file: inputFile, caption: "SnapCloud File", forceDocument: true });
+    
+    // Obtenemos un ID compatible usando el bot
     const finalFileId = await getTelegramFileId(messageResult.id, chatId);
-
     return { telegram_id: finalFileId, message_id: messageResult.id };
 }
 
-/**
- * 🖼️ NUEVO: Sube una miniatura desde un Buffer (Memoria)
- */
 export async function uploadThumbnailBuffer(buffer) {
     await initClient();
-    // Subimos la imagen directamente desde el buffer
     const messageResult = await client.sendFile(botChatId, {
         file: buffer,
         caption: "thumb",
-        forceDocument: false // Enviar como foto
+        forceDocument: false 
     });
+    return await getTelegramFileId(messageResult.id, botChatId);
+}
+
+// --- AUXILIARES ---
+async function getTelegramFileId(messageId, channelIdBigInt) {
+    if (!BOT_TOKEN) return "no_bot_token";
+    const channelIdStr = channelIdBigInt.toString(); 
     
-    // Obtenemos el ID compatible
-    const fileId = await getTelegramFileId(messageResult.id, botChatId);
-    return fileId; // Retornamos solo el ID de la foto
+    try {
+        const url = `https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`;
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: channelIdStr, from_chat_id: channelIdStr, message_id: messageId })
+        });
+        const data = await res.json();
+        if (!data.ok) return null;
+
+        const fwd = data.result;
+        let fid = null;
+        if (fwd.document) fid = fwd.document.file_id;
+        else if (fwd.photo) fid = fwd.photo[fwd.photo.length - 1].file_id;
+        
+        // Limpieza
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: channelIdStr, message_id: fwd.message_id })
+        });
+        return fid;
+    } catch (e) { return null; }
 }
 
 export async function getFileUrl(fileId) {
-    if (!BOT_TOKEN) throw new Error("BOT_TOKEN faltante.");
+    if (!BOT_TOKEN) return null;
     try {
         const url = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
         const res = await fetch(url);
@@ -143,12 +130,32 @@ export async function getFileUrl(fileId) {
     } catch (e) { return null; }
 }
 
+// --- STREAMING (CRÍTICO) ---
 export async function streamFile(messageId, res) {
     await initClient();
+    
+    // Buscamos el mensaje en el canal
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
-    if (!msgs[0] || !msgs[0].media) throw new Error("No media.");
-    const stream = client.iterDownload(msgs[0].media, { chunkSize: 512 * 1024 });
-    res.on('close', () => res.end());
-    for await (const chunk of stream) res.write(chunk);
+    
+    if (!msgs || msgs.length === 0 || !msgs[0]) {
+        throw new Error("Mensaje no encontrado en Telegram (puede haber sido borrado).");
+    }
+    
+    const msg = msgs[0];
+    if (!msg.media) {
+        throw new Error("El mensaje existe pero no tiene archivo adjunto.");
+    }
+
+    // Streaming directo
+    const stream = client.iterDownload(msg.media, { chunkSize: 128 * 1024 });
+    
+    res.on('close', () => {
+        console.log("Cliente cerró conexión, deteniendo stream.");
+        res.end();
+    });
+
+    for await (const chunk of stream) {
+        res.write(chunk);
+    }
     res.end();
 }
