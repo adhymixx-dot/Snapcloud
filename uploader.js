@@ -20,15 +20,14 @@ async function initClient() {
     await clientPromise;
 }
 
-// --- SUBIDA BLINDADA ---
+// --- SUBIDA (Sin cambios, funciona bien) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
-    const PART_SIZE = 512 * 1024; // 512KB
+    const PART_SIZE = 512 * 1024;
     const totalParts = fileSize > 0 ? Math.ceil(fileSize / PART_SIZE) : -1;
 
-    console.log(`🌊 Subiendo: ${fileName} (${fileSize} bytes)`);
-    
+    console.log(`🌊 Subiendo: ${fileName}`);
     let partIndex = 0;
     let buffer = Buffer.alloc(0);
 
@@ -68,11 +67,11 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     };
 }
 
-// --- VISUALIZACIÓN INTELIGENTE (STREAMING CON RANGOS) ---
+// --- VISUALIZACIÓN BLINDADA (128KB + LÍMITE FIJO) ---
 export async function streamFile(messageId, res, range) {
     await initClient();
     
-    // 1. Obtener metadatos reales de Telegram
+    // 1. Obtener info del archivo
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
     if (!msgs || !msgs[0]) throw new Error("Mensaje no encontrado");
     const msg = msgs[0];
@@ -108,67 +107,71 @@ export async function streamFile(messageId, res, range) {
 
     if (!location) throw new Error("Sin archivo válido");
 
-    // 2. LÓGICA DE STREAMING
+    // 2. Preparar Rangos
+    // Si hay rango, lo usamos. Si no, descargamos todo.
+    let start = 0;
+    let end = fileSize - 1;
+
     if (range) {
         const parts = range.replace(/bytes=/, "").split("-");
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-        const chunksize = (end - start) + 1;
+        start = parseInt(parts[0], 10);
+        end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    }
 
-        console.log(`✂️ Stream Parcial: ${start}-${end} (${mimeType})`);
+    const chunksize = (end - start) + 1;
+    console.log(`🎬 Stream: ${start}-${end} (${chunksize} bytes)`);
 
+    // 3. Escribir Cabeceras HTTP
+    if (range) {
         res.writeHead(206, {
             'Content-Range': `bytes ${start}-${end}/${fileSize}`,
             'Accept-Ranges': 'bytes',
             'Content-Length': chunksize,
             'Content-Type': mimeType,
         });
-
-        await streamChunksToRes(location, res, start, end);
     } else {
-        console.log(`⬇️ Descarga Completa: ${fileSize} bytes`);
         res.writeHead(200, {
             'Content-Length': fileSize,
             'Content-Type': mimeType,
         });
-        await streamChunksToRes(location, res, 0, fileSize - 1);
     }
-}
 
-// --- CORRECCIÓN AQUÍ: Función auxiliar para descargar y enviar bytes ---
-async function streamChunksToRes(location, res, startByte, endByte) {
-    let offset = BigInt(startByte);
-    const end = BigInt(endByte);
-    
-    // IMPORTANTE: El límite SIEMPRE debe ser múltiplo de 4KB (4096 bytes).
-    // Usamos 512KB (512 * 1024) que es seguro y rápido.
-    const REQUEST_LIMIT = 512 * 1024; 
+    // 4. BUCLE DE DESCARGA SEGURO
+    // Usamos 128KB. Es el tamaño "mágico" de Telegram que nunca falla.
+    const KB_BLOCK = 128 * 1024; 
+    let currentOffset = BigInt(start);
+    const finalByte = BigInt(end);
 
     try {
-        while (offset <= end) {
-            // Ya NO calculamos un límite dinámico. Pedimos siempre el bloque completo.
-            // Telegram gestionará internamente si queda menos archivo.
+        while (currentOffset <= finalByte) {
+            // TRUCO IMPORTANTE:
+            // Telegram exige que 'limit' sea múltiplo de 4KB.
+            // NO calculamos cuánto falta. Pedimos SIEMPRE 128KB.
+            // Si el archivo se acaba antes, Telegram nos devolverá menos bytes y el bucle terminará solo.
             
             const result = await client.invoke(new Api.upload.GetFile({
                 location: location,
-                offset: offset,
-                limit: REQUEST_LIMIT // Siempre constante para evitar LIMIT_INVALID
+                offset: currentOffset,
+                limit: KB_BLOCK // <--- ESTO ES CONSTANTE. NUNCA CAMBIA.
             }));
 
             if (!result || result.bytes.length === 0) break;
 
-            // Enviar al cliente
+            // Escribimos al navegador
             res.write(result.bytes);
             
-            // Avanzamos el offset según lo que REALMENTE nos devolvió Telegram
-            offset += BigInt(result.bytes.length);
+            // Avanzamos
+            currentOffset += BigInt(result.bytes.length);
 
-            // Si el cliente cierra la conexión (pausa video, cierra pestaña), abortamos
+            // Si Telegram nos devolvió menos de lo que pedimos, significa que se acabó el archivo.
+            if (result.bytes.length < KB_BLOCK) break;
+
+            // Si el usuario cerró el video, paramos para ahorrar RAM
             if (res.writableEnded || res.closed) break;
         }
-        if (!res.writableEnded) res.end();
     } catch (err) {
-        console.error("❌ Error Stream Pipe:", err);
+        console.error("❌ Error en Stream:", err);
+    } finally {
         if (!res.writableEnded) res.end();
     }
 }
