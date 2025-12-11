@@ -8,8 +8,7 @@ const chatId = BigInt(process.env.TELEGRAM_CHANNEL_ID);
 const botChatId = BigInt(process.env.BOT_CHANNEL_ID || chatId);
 const BOT_TOKEN = process.env.BOT_TOKEN; 
 
-// --- 1. GESTIÓN DE LA GRANJA DE BOTS (WORKERS) ---
-// Leemos los tokens de los trabajadores desde el .env
+// --- GESTIÓN DE BOTS ---
 const workerTokens = (process.env.WORKER_TOKENS || "").split(",");
 const clients = [];
 let isConnecting = false;
@@ -17,56 +16,30 @@ let isConnecting = false;
 async function initClients() {
     if (clients.length > 0 || isConnecting) return;
     isConnecting = true;
-    
-    // Filtramos tokens vacíos
     const validTokens = workerTokens.filter(t => t && t.length > 10);
 
-    if (validTokens.length === 0) {
-        console.log("ℹ️ No hay WORKER_TOKENS definidos. Usando fallback si es posible.");
-    } else {
-        console.log(`🚀 Iniciando Granja de Bots (${validTokens.length} trabajadores)...`);
-    }
+    if (validTokens.length === 0) console.log("ℹ️ No WORKER_TOKENS. Usando fallback.");
+    else console.log(`🚀 Iniciando Granja (${validTokens.length} bots)...`);
 
-    const promises = validTokens.map(async (token, index) => {
+    await Promise.all(validTokens.map(async (token) => {
         try {
-            // Creamos cliente SIN sesión guardada (los bots usan token)
-            const client = new TelegramClient(new StringSession(""), apiId, apiHash, { 
-                connectionRetries: 5,
-                useWSS: false // TCP directo es más rápido para streaming
-            });
-            
-            // Login con Token de Bot
-            await client.start({
-                botAuthToken: token.trim(),
-            });
-
+            const client = new TelegramClient(new StringSession(""), apiId, apiHash, { connectionRetries: 5, useWSS: false });
+            await client.start({ botAuthToken: token.trim() });
             clients.push(client);
-            console.log(`✅ Bot Trabajador ${index + 1} conectado.`);
-        } catch (e) {
-            console.error(`❌ Falló Bot Trabajador ${index + 1}:`, e.message);
-        }
-    });
-
-    await Promise.all(promises);
+        } catch (e) { console.error("❌ Error Worker:", e.message); }
+    }));
     isConnecting = false;
 }
 
-// Elige un bot al azar para trabajar
 async function getWorker() {
     await initClients();
-    
-    if (clients.length === 0) {
-        // Si no hay workers, lanzamos error (o podrías configurar un fallback aquí)
-        throw new Error("No hay bots trabajadores disponibles. Configura WORKER_TOKENS en .env");
-    }
-    
+    if (clients.length === 0) throw new Error("No workers available. Check WORKER_TOKENS");
     return clients[Math.floor(Math.random() * clients.length)];
 }
 
-// --- 2. SUBIDA ---
+// --- UPLOAD ---
 export async function uploadFromStream(stream, fileName, fileSize) {
-    const client = await getWorker(); // Usamos un bot cualquiera
-    
+    const client = await getWorker();
     const fileId = BigInt(Date.now());
     const PART_SIZE = 512 * 1024;
     const totalParts = fileSize > 0 ? Math.ceil(fileSize / PART_SIZE) : -1;
@@ -80,200 +53,103 @@ export async function uploadFromStream(stream, fileName, fileSize) {
         while (buffer.length >= PART_SIZE) {
             const chunkToSend = buffer.slice(0, PART_SIZE);
             buffer = buffer.slice(PART_SIZE);
-            try {
-                await client.invoke(new Api.upload.SaveBigFilePart({
-                    fileId: fileId,
-                    filePart: partIndex,
-                    fileTotalParts: totalParts,
-                    bytes: chunkToSend
-                }));
-                partIndex++;
-            } catch (err) { throw err; }
+            await client.invoke(new Api.upload.SaveBigFilePart({ fileId, filePart: partIndex, fileTotalParts: totalParts, bytes: chunkToSend }));
+            partIndex++;
         }
     }
-
     if (buffer.length > 0) {
-        await client.invoke(new Api.upload.SaveBigFilePart({
-            fileId: fileId,
-            filePart: partIndex,
-            fileTotalParts: totalParts,
-            bytes: buffer
-        }));
+        await client.invoke(new Api.upload.SaveBigFilePart({ fileId, filePart: partIndex, fileTotalParts: totalParts, bytes: buffer }));
         partIndex++;
     }
 
     const inputFile = new Api.InputFileBig({ id: fileId, parts: partIndex, name: fileName });
-    
-    // Importante: El bot que subió el archivo lo envía al canal
     const res = await client.sendFile(chatId, { file: inputFile, forceDocument: true, caption: fileName });
-
-    return { 
-        telegram_id: await getTelegramFileId(res.id, chatId), 
-        message_id: res.id 
-    };
+    return { telegram_id: await getTelegramFileId(res.id, chatId), message_id: res.id };
 }
 
-// --- 3. STREAMING (REPRODUCCIÓN BALANCEADA) ---
+// --- STREAMING (512KB TURBO) ---
 export async function streamFile(messageId, res, range) {
-    const client = await getWorker(); // Asignamos un bot aleatorio al usuario
-    
-    // IMPORTANTE: El bot debe ser ADMIN del canal para poder ver este mensaje
+    const client = await getWorker();
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
-    if (!msgs || !msgs[0]) throw new Error("Mensaje no encontrado (¿El bot es admin del canal?)");
+    if (!msgs[0]) throw new Error("Mensaje no encontrado");
     const msg = msgs[0];
+    let location = null, fileSize = 0, mime = "application/octet-stream";
 
-    let location = null;
-    let fileSize = 0;
-    let mimeType = "application/octet-stream";
-
-    if (msg.media) {
-        if (msg.media.document) {
-            const doc = msg.media.document;
-            fileSize = Number(doc.size);
-            mimeType = doc.mimeType;
-            location = new Api.InputDocumentFileLocation({
-                id: doc.id,
-                accessHash: doc.accessHash,
-                fileReference: doc.fileReference,
-                thumbSize: ""
-            });
-        } else if (msg.media.photo) {
-            const photo = msg.media.photo;
-            const size = photo.sizes[photo.sizes.length - 1];
-            fileSize = size.size;
-            mimeType = "image/jpeg";
-            location = new Api.InputPhotoFileLocation({
-                id: photo.id,
-                accessHash: photo.accessHash,
-                fileReference: photo.fileReference,
-                thumbSize: size.type
-            });
-        }
+    if (msg.media?.document) {
+        fileSize = Number(msg.media.document.size); mime = msg.media.document.mimeType;
+        location = new Api.InputDocumentFileLocation({ id: msg.media.document.id, accessHash: msg.media.document.accessHash, fileReference: msg.media.document.fileReference, thumbSize: "" });
+    } else if (msg.media?.photo) {
+        const p = msg.media.photo; const s = p.sizes[p.sizes.length-1]; fileSize = s.size; mime = "image/jpeg";
+        location = new Api.InputPhotoFileLocation({ id: p.id, accessHash: p.accessHash, fileReference: p.fileReference, thumbSize: s.type });
     }
 
-    if (!location) throw new Error("Sin archivo válido");
-
-    // Gestión de Rangos
-    let start = 0;
-    let end = fileSize - 1;
-
+    if (!location) throw new Error("No media");
+    
+    let start = 0, end = fileSize - 1;
     if (range) {
         const parts = range.replace(/bytes=/, "").split("-");
         start = parseInt(parts[0], 10);
         end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
     }
 
-    const chunksize = (end - start) + 1;
-
-    if (range) {
-        res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-            'Accept-Ranges': 'bytes',
-            'Content-Length': chunksize,
-            'Content-Type': mimeType,
-        });
-    } else {
-        res.writeHead(200, {
-            'Content-Length': fileSize,
-            'Content-Type': mimeType,
-        });
-    }
+    const chunk = (end - start) + 1;
+    res.writeHead(range ? 206 : 200, {
+        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+        'Accept-Ranges': 'bytes', 'Content-Length': chunk, 'Content-Type': mime
+    });
 
     await streamChunksToRes(client, location, res, start, end, fileSize);
 }
 
-// --- 4. ALGORITMO ESCALERA (MODO TURBO 512KB) ---
-// Esta versión evita el error LIMIT_INVALID y el error QUIC/Buffering
 async function streamChunksToRes(client, location, res, requestedStart, requestedEnd, totalFileSize) {
     let currentOffset = BigInt(requestedStart - (requestedStart % 4096));
     const end = BigInt(requestedEnd);
     const totalSize = BigInt(totalFileSize);
     let initialSkip = requestedStart % 4096;
-
-    // BLOQUE BASE GRANDE PARA VELOCIDAD (512KB)
     const BASE_CHUNK = 512 * 1024; 
 
     try {
         while (currentOffset <= end) {
-            const remainingInFile = totalSize - currentOffset;
-            if (remainingInFile <= 0n) break;
-
-            // Por defecto pedimos 512KB
+            const remaining = totalSize - currentOffset;
+            if (remaining <= 0n) break;
+            
             let limit = BASE_CHUNK;
-
-            // Si estamos al final y queda MENOS de 512KB, usamos potencias de 2
-            // Esto es obligatorio para que Telegram no rechace la petición
-            if (remainingInFile < BigInt(BASE_CHUNK)) {
-                if (remainingInFile <= 4096n) limit = 4096;
-                else if (remainingInFile <= 8192n) limit = 8192;
-                else if (remainingInFile <= 16384n) limit = 16384;
-                else if (remainingInFile <= 32768n) limit = 32768;
-                else if (remainingInFile <= 65536n) limit = 65536;
-                else if (remainingInFile <= 131072n) limit = 131072;
-                else limit = 262144; // 256KB
+            if (remaining < BigInt(BASE_CHUNK)) {
+                if (remaining <= 4096n) limit = 4096;
+                else if (remaining <= 8192n) limit = 8192;
+                else if (remaining <= 16384n) limit = 16384;
+                else if (remaining <= 32768n) limit = 32768;
+                else if (remaining <= 65536n) limit = 65536;
+                else if (remaining <= 131072n) limit = 131072;
+                else limit = 262144;
             }
 
-            const result = await client.invoke(new Api.upload.GetFile({
-                location: location,
-                offset: currentOffset,
-                limit: limit
-            }));
-
-            if (!result || result.bytes.length === 0) break;
+            const result = await client.invoke(new Api.upload.GetFile({ location, offset: currentOffset, limit }));
+            if (!result || !result.bytes.length) break;
 
             let chunk = result.bytes;
-            
-            // Recorte inicial si alineamos hacia atrás
-            if (initialSkip > 0) {
-                chunk = chunk.slice(initialSkip);
-                initialSkip = 0;
-            }
+            if (initialSkip > 0) { chunk = chunk.slice(initialSkip); initialSkip = 0; }
 
-            // Verificamos si podemos escribir antes de hacerlo
-            if (!res.writableEnded && !res.closed) {
-                res.write(chunk);
-            } else {
-                break; 
-            }
-
+            if (!res.writableEnded && !res.closed) res.write(chunk); else break;
             currentOffset += BigInt(result.bytes.length);
-
-            // Si Telegram devolvió menos de lo pedido, asumimos fin de archivo
             if (result.bytes.length < limit) break;
         }
-    } catch (err) {
-        // Warning silencioso para desconexiones normales de usuario
-        console.warn("⚠️ Stream info:", err.message);
-    } finally {
-        if (!res.writableEnded) res.end();
-    }
+    } catch (err) { console.warn("Stream warning:", err.message); } 
+    finally { if (!res.writableEnded) res.end(); }
 }
 
-// --- AUXILIARES ---
 export async function uploadThumbnailBuffer(buffer) {
-    const client = await getWorker(); 
+    const client = await getWorker();
     const res = await client.sendFile(botChatId, { file: buffer, forceDocument: false });
     return await getTelegramFileId(res.id, botChatId);
 }
 
 export async function getFileUrl(fileId) {
     if (!BOT_TOKEN) return null;
-    try {
-        const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`);
-        const d = await res.json();
-        if (d.ok) return `https://api.telegram.org/file/bot${BOT_TOKEN}/${d.result.file_path}`;
-    } catch (e) {} 
-    return null;
+    try { const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`); const d = await r.json(); if(d.ok) return `https://api.telegram.org/file/bot${BOT_TOKEN}/${d.result.file_path}`; } catch (e) {} return null;
 }
 
 async function getTelegramFileId(msgId, chId) {
     if(!BOT_TOKEN) return null;
-    try {
-        const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:chId.toString(), from_chat_id:chId.toString(), message_id:msgId}) });
-        const d = await res.json();
-        if(d.ok) {
-            await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:chId.toString(), message_id:d.result.message_id}) });
-            return d.result.document?.file_id || d.result.photo?.pop()?.file_id;
-        }
-    } catch(e){} return null;
+    try { const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:chId.toString(), from_chat_id:chId.toString(), message_id:msgId}) }); const d = await r.json(); if(d.ok) { await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:chId.toString(), message_id:d.result.message_id}) }); return d.result.document?.file_id || d.result.photo?.pop()?.file_id; } } catch(e){} return null;
 }
