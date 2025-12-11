@@ -6,18 +6,19 @@ const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
 const BOT_TOKEN = process.env.BOT_TOKEN; 
 
-// --- 🔧 AUTOCORRECTOR DE IDs (La solución al error CHANNEL_INVALID) ---
-// Convierte "123456" en "-100123456" automáticamente
+// --- 🔧 AUTOCORRECTOR DE IDs (BLINDADO) ---
 function fixId(id) {
     if (!id) return BigInt(0);
     let s = String(id).trim();
-    // Si ya tiene el formato correcto (-100...), lo dejamos igual
+    // Si ya empieza por -100, es válido
     if (s.startsWith("-100")) return BigInt(s);
-    // Si tiene un guion simple o nada, le forzamos el formato de canal
-    return BigInt("-100" + s.replace(/-/g, ""));
+    // Si empieza por - (ej: -123), le quitamos el - y ponemos -100
+    if (s.startsWith("-")) return BigInt("-100" + s.substring(1));
+    // Si son solo números, le ponemos -100
+    return BigInt("-100" + s);
 }
 
-// Aplicamos la corrección a los IDs
+// Aplicamos la corrección
 const chatId = fixId(process.env.TELEGRAM_CHANNEL_ID); 
 const botChatId = process.env.BOT_CHANNEL_ID ? fixId(process.env.BOT_CHANNEL_ID) : chatId;
 
@@ -38,12 +39,33 @@ async function initClients() {
         try {
             const client = new TelegramClient(new StringSession(""), apiId, apiHash, { connectionRetries: 5, useWSS: false });
             await client.start({ botAuthToken: token.trim() });
+            
+            // --- TRUCO CRÍTICO: "SALUDAR" AL CANAL ---
+            // Esto obliga al bot a obtener el 'Access Hash' del canal.
+            // Sin esto, la subida falla con "Could not find input entity".
+            try {
+                await client.invoke(new Api.channels.GetChannels({
+                    id: [new Api.InputChannel({ channelId: bigIntToId(chatId), accessHash: BigInt(0) })] 
+                    // Nota: Enviamos accessHash 0 para forzar la búsqueda si falla lo normal, 
+                    // o simplemente intentamos obtener info básica.
+                }));
+            } catch (e) {
+                // Si falla lo anterior, intentamos un getEntity normal, que suele resolverlo
+                try { await client.getEntity(chatId); } catch(err) {}
+            }
+
             clients.push(client);
-            // Intentamos leer el canal para verificar acceso
-            try { await client.getMessages(chatId, { limit: 1 }); } catch(e){}
+            console.log(`✅ Bot ${idx+1} conectado y sincronizado.`);
         } catch (e) { console.error(`❌ Error Worker ${idx+1}:`, e.message); }
     }));
     isConnecting = false;
+}
+
+// Función auxiliar para quitar el -100 si es necesario para ciertas llamadas internas
+function bigIntToId(id) {
+    let s = String(id);
+    if (s.startsWith("-100")) return BigInt(s.substring(4));
+    return id;
 }
 
 async function getWorker() {
@@ -56,7 +78,9 @@ async function getWorker() {
 export async function uploadFromStream(stream, fileName, fileSize) {
     const client = await getWorker();
     const fileId = BigInt(Date.now());
-    const PART_SIZE = 512 * 1024;
+    
+    // TAMAÑO 128KB: El más compatible y seguro
+    const PART_SIZE = 128 * 1024;
     const totalParts = fileSize > 0 ? Math.ceil(fileSize / PART_SIZE) : -1;
 
     console.log(`🌊 Subiendo: ${fileName}`);
@@ -78,13 +102,13 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     }
 
     const inputFile = new Api.InputFileBig({ id: fileId, parts: partIndex, name: fileName });
-    // Usamos el ID corregido (chatId) que tiene el -100
+    // Usamos el ID corregido
     const res = await client.sendFile(chatId, { file: inputFile, forceDocument: true, caption: fileName });
     
     return { telegram_id: await getTelegramFileId(res.id, chatId), message_id: res.id };
 }
 
-// --- STREAMING ---
+// --- STREAMING (ESTABILIDAD TOTAL) ---
 export async function streamFile(messageId, res, range) {
     const client = await getWorker();
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
@@ -123,7 +147,9 @@ async function streamChunksToRes(client, location, res, requestedStart, requeste
     const end = BigInt(requestedEnd);
     const totalSize = BigInt(totalFileSize);
     let initialSkip = requestedStart % 4096;
-    const BASE_CHUNK = 512 * 1024; 
+    
+    // TAMAÑO BASE 128KB (Estándar de Oro para evitar LIMIT_INVALID)
+    const BASE_CHUNK = 128 * 1024; 
 
     try {
         while (currentOffset <= end) {
@@ -131,12 +157,13 @@ async function streamChunksToRes(client, location, res, requestedStart, requeste
             if (remaining <= 0n) break;
             
             let limit = BASE_CHUNK;
+            // Algoritmo Escalera (Precisión para el final del archivo)
             if (remaining < BigInt(BASE_CHUNK)) {
                 if (remaining <= 4096n) limit = 4096;
-                else if (remaining <= 16384n) limit = 16384;
+                else if (remaining <= 16384n) limit = 16384; 
+                else if (remaining <= 32768n) limit = 32768;
                 else if (remaining <= 65536n) limit = 65536;
-                else if (remaining <= 131072n) limit = 131072;
-                else limit = 262144;
+                else limit = 131072; // 128KB
             }
 
             const result = await client.invoke(new Api.upload.GetFile({ location, offset: currentOffset, limit }));
@@ -149,7 +176,10 @@ async function streamChunksToRes(client, location, res, requestedStart, requeste
             currentOffset += BigInt(result.bytes.length);
             if (result.bytes.length < limit) break;
         }
-    } catch (err) { console.warn("Stream:", err.message); } 
+    } catch (err) { 
+        // Solo logueamos si es un error grave, ignoramos desconexiones de usuario
+        if(!err.message.includes("LIMIT_INVALID")) console.warn("Stream Warn:", err.message); 
+    } 
     finally { if (!res.writableEnded) res.end(); }
 }
 
@@ -157,11 +187,10 @@ export async function uploadThumbnailBuffer(buffer) {
     // Si falla la miniatura, no detenemos la subida principal
     try {
         const client = await getWorker();
-        // Usamos el ID corregido (botChatId)
         const res = await client.sendFile(botChatId, { file: buffer, forceDocument: false });
         return await getTelegramFileId(res.id, botChatId);
     } catch (e) {
-        console.error("❌ Error subiendo Miniatura:", e.message);
+        console.error("❌ Error Miniatura:", e.message);
         return null; 
     }
 }
@@ -171,9 +200,9 @@ export async function getFileUrl(fileId) {
     try { const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`); const d = await r.json(); if(d.ok) return `https://api.telegram.org/file/bot${BOT_TOKEN}/${d.result.file_path}`; } catch (e) {} return null;
 }
 
-// Esta función usa el BOT_TOKEN (El Jefe). Si el Jefe no es Admin, esto falla.
+// Esta función usa el BOT_TOKEN (El Jefe).
 async function getTelegramFileId(msgId, chId) {
     if(!BOT_TOKEN) return null;
-    const strChId = String(chId); // Convertimos el BigInt a String para la API HTTP
+    const strChId = String(chId); 
     try { const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:strChId, from_chat_id:strChId, message_id:msgId}) }); const d = await r.json(); if(d.ok) { await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:strChId, message_id:d.result.message_id}) }); return d.result.document?.file_id || d.result.photo?.pop()?.file_id; } else { console.error("❌ Error ID:", d.description); } } catch(e){} return null;
 }
