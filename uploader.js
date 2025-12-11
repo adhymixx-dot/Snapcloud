@@ -36,7 +36,7 @@ async function initClients() {
             const client = new TelegramClient(new StringSession(""), apiId, apiHash, { connectionRetries: 5, useWSS: false });
             await client.start({ botAuthToken: token.trim() });
             
-            // SALUDO AL CANAL (Evita error "Input entity not found")
+            // Saludo obligatorio para evitar errores de entidad
             try {
                 await client.invoke(new Api.channels.GetChannels({
                     id: [new Api.InputChannel({ channelId: bigIntToId(chatId), accessHash: BigInt(0) })] 
@@ -66,7 +66,7 @@ async function getWorker() {
 export async function uploadFromStream(stream, fileName, fileSize) {
     const client = await getWorker();
     const fileId = BigInt(Date.now());
-    const PART_SIZE = 128 * 1024; // 128KB es lo más seguro para subir
+    const PART_SIZE = 128 * 1024; // 128KB para subida segura
     const totalParts = fileSize > 0 ? Math.ceil(fileSize / PART_SIZE) : -1;
 
     console.log(`🌊 Subiendo: ${fileName}`);
@@ -93,7 +93,7 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     return { telegram_id: await getTelegramFileId(res.id, chatId), message_id: res.id };
 }
 
-// --- STREAMING (FIX QUIC ERROR + LIMIT_INVALID) ---
+// --- STREAMING (SIN LATENCIA) ---
 export async function streamFile(messageId, res, range) {
     const client = await getWorker();
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
@@ -127,31 +127,24 @@ export async function streamFile(messageId, res, range) {
     await streamChunksToRes(client, location, res, start, end, fileSize);
 }
 
-// --- NÚCLEO HÍBRIDO CON BACKPRESSURE ---
+// --- NÚCLEO DE TRANSMISIÓN DIRECTA ---
 async function streamChunksToRes(client, location, res, requestedStart, requestedEnd, totalFileSize) {
     let currentOffset = BigInt(requestedStart - (requestedStart % 4096));
     const end = BigInt(requestedEnd);
     const totalSize = BigInt(totalFileSize);
     let initialSkip = requestedStart % 4096;
     
-    // 1. DESCARGAMOS de Telegram en bloques pequeños y seguros (128KB)
-    // Esto evita el error LIMIT_INVALID
-    const TELEGRAM_FETCH_SIZE = 128 * 1024; 
-    
-    // 2. ENVIAMOS al Navegador en bloques grandes (1MB)
-    // Esto evita el error QUIC_PROTOCOL_ERROR (menos paquetes de red)
-    const BROWSER_FLUSH_SIZE = 1024 * 1024; 
-
-    let browserBuffer = Buffer.alloc(0);
+    // 128KB: Tamaño nativo de Telegram. Es el más rápido porque no requiere conversión.
+    const CHUNK_SIZE = 128 * 1024; 
 
     try {
         while (currentOffset <= end) {
             const remaining = totalSize - currentOffset;
             if (remaining <= 0n) break;
             
-            // Lógica de "Escalera" para Telegram (Seguridad API)
-            let limit = TELEGRAM_FETCH_SIZE;
-            if (remaining < BigInt(TELEGRAM_FETCH_SIZE)) {
+            // Lógica Escalera para Telegram (Evita LIMIT_INVALID)
+            let limit = CHUNK_SIZE;
+            if (remaining < BigInt(CHUNK_SIZE)) {
                 if (remaining <= 4096n) limit = 4096;
                 else if (remaining <= 16384n) limit = 16384; 
                 else if (remaining <= 32768n) limit = 32768;
@@ -159,44 +152,33 @@ async function streamChunksToRes(client, location, res, requestedStart, requeste
                 else limit = 131072;
             }
 
+            // Descarga de Telegram
             const result = await client.invoke(new Api.upload.GetFile({ location, offset: currentOffset, limit }));
             if (!result || !result.bytes.length) break;
 
             let chunk = result.bytes;
             
-            // Cortar sobrante inicial si es necesario
+            // Recorte inicial si fue necesario alinear
             if (initialSkip > 0) { 
                 chunk = chunk.slice(initialSkip); 
                 initialSkip = 0; 
             }
 
-            // ACUMULAR EN MEMORIA INTERNA
-            browserBuffer = Buffer.concat([browserBuffer, chunk]);
-            currentOffset += BigInt(result.bytes.length);
-
-            // SOLO ENVIAR SI TENEMOS 1MB O ES EL FINAL
-            // Esto estabiliza la conexión HTTP/3 (QUIC)
-            if (browserBuffer.length >= BROWSER_FLUSH_SIZE || currentOffset > end || result.bytes.length < limit) {
-                
-                // BACKPRESSURE: Si el navegador dice "Espera" (write devuelve false), esperamos al evento 'drain'
-                const canContinue = res.write(browserBuffer);
-                browserBuffer = Buffer.alloc(0); // Limpiar buffer
-
-                if (!canContinue) {
-                    // Pausamos la descarga de Telegram hasta que el navegador respire
-                    await new Promise(resolve => res.once('drain', resolve));
-                }
+            // --- CAMBIO CLAVE: ENVÍO INMEDIATO ---
+            // No acumulamos buffer. Enviamos lo que llega al instante.
+            const canContinue = res.write(chunk);
+            
+            // Si el navegador se llena, esperamos (Backpressure)
+            if (!canContinue) {
+                // Pausamos la descarga de Telegram hasta que el navegador respire
+                await new Promise(resolve => res.once('drain', resolve));
             }
+
+            currentOffset += BigInt(result.bytes.length);
 
             if (res.writableEnded || res.closed) break;
             if (result.bytes.length < limit) break;
         }
-        
-        // Enviar remanente final si queda algo
-        if (browserBuffer.length > 0 && !res.writableEnded) {
-            res.write(browserBuffer);
-        }
-
     } catch (err) { 
         if(!err.message.includes("LIMIT_INVALID")) console.warn("Stream Warn:", err.message); 
     } 
