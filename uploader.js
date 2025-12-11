@@ -6,7 +6,7 @@ const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
 const chatId = BigInt(process.env.TELEGRAM_CHANNEL_ID); 
 const botChatId = BigInt(process.env.BOT_CHANNEL_ID || chatId);
-const BOT_TOKEN = process.env.BOT_TOKEN; // Tu bot principal
+const BOT_TOKEN = process.env.BOT_TOKEN; 
 
 // --- 1. GESTIÓN DE LA GRANJA DE BOTS (WORKERS) ---
 // Leemos los tokens de los trabajadores desde el .env
@@ -22,17 +22,17 @@ async function initClients() {
     const validTokens = workerTokens.filter(t => t && t.length > 10);
 
     if (validTokens.length === 0) {
-        console.log("⚠️ No hay WORKER_TOKENS definidos. Usando solo el bot principal si es posible.");
+        console.log("ℹ️ No hay WORKER_TOKENS definidos. Usando fallback si es posible.");
     } else {
         console.log(`🚀 Iniciando Granja de Bots (${validTokens.length} trabajadores)...`);
     }
 
     const promises = validTokens.map(async (token, index) => {
         try {
-            // Creamos cliente SIN sesión guardada (los bots no la necesitan tanto)
+            // Creamos cliente SIN sesión guardada (los bots usan token)
             const client = new TelegramClient(new StringSession(""), apiId, apiHash, { 
                 connectionRetries: 5,
-                useWSS: false 
+                useWSS: false // TCP directo es más rápido para streaming
             });
             
             // Login con Token de Bot
@@ -55,9 +55,10 @@ async function initClients() {
 async function getWorker() {
     await initClients();
     
-    // Si no hay trabajadores extra, intentamos usar el cliente principal si existiera, 
-    // o lanzamos error.
-    if (clients.length === 0) throw new Error("No hay bots trabajadores disponibles. Revisa WORKER_TOKENS en el .env");
+    if (clients.length === 0) {
+        // Si no hay workers, lanzamos error (o podrías configurar un fallback aquí)
+        throw new Error("No hay bots trabajadores disponibles. Configura WORKER_TOKENS en .env");
+    }
     
     return clients[Math.floor(Math.random() * clients.length)];
 }
@@ -181,26 +182,35 @@ export async function streamFile(messageId, res, range) {
     await streamChunksToRes(client, location, res, start, end, fileSize);
 }
 
-// --- 4. ALGORITMO ESCALERA (OPTIMIZADO) ---
+// --- 4. ALGORITMO ESCALERA (MODO TURBO 512KB) ---
+// Esta versión evita el error LIMIT_INVALID y el error QUIC/Buffering
 async function streamChunksToRes(client, location, res, requestedStart, requestedEnd, totalFileSize) {
     let currentOffset = BigInt(requestedStart - (requestedStart % 4096));
     const end = BigInt(requestedEnd);
     const totalSize = BigInt(totalFileSize);
     let initialSkip = requestedStart % 4096;
-    const BASE_CHUNK = 64 * 1024; 
+
+    // BLOQUE BASE GRANDE PARA VELOCIDAD (512KB)
+    const BASE_CHUNK = 512 * 1024; 
 
     try {
         while (currentOffset <= end) {
             const remainingInFile = totalSize - currentOffset;
             if (remainingInFile <= 0n) break;
 
+            // Por defecto pedimos 512KB
             let limit = BASE_CHUNK;
+
+            // Si estamos al final y queda MENOS de 512KB, usamos potencias de 2
+            // Esto es obligatorio para que Telegram no rechace la petición
             if (remainingInFile < BigInt(BASE_CHUNK)) {
                 if (remainingInFile <= 4096n) limit = 4096;
                 else if (remainingInFile <= 8192n) limit = 8192;
                 else if (remainingInFile <= 16384n) limit = 16384;
                 else if (remainingInFile <= 32768n) limit = 32768;
-                else limit = 65536;
+                else if (remainingInFile <= 65536n) limit = 65536;
+                else if (remainingInFile <= 131072n) limit = 131072;
+                else limit = 262144; // 256KB
             }
 
             const result = await client.invoke(new Api.upload.GetFile({
@@ -212,19 +222,28 @@ async function streamChunksToRes(client, location, res, requestedStart, requeste
             if (!result || result.bytes.length === 0) break;
 
             let chunk = result.bytes;
+            
+            // Recorte inicial si alineamos hacia atrás
             if (initialSkip > 0) {
                 chunk = chunk.slice(initialSkip);
                 initialSkip = 0;
             }
 
-            res.write(chunk);
+            // Verificamos si podemos escribir antes de hacerlo
+            if (!res.writableEnded && !res.closed) {
+                res.write(chunk);
+            } else {
+                break; 
+            }
+
             currentOffset += BigInt(result.bytes.length);
 
-            if (res.writableEnded || res.closed) break;
+            // Si Telegram devolvió menos de lo pedido, asumimos fin de archivo
             if (result.bytes.length < limit) break;
         }
     } catch (err) {
-        // Ignorar errores leves
+        // Warning silencioso para desconexiones normales de usuario
+        console.warn("⚠️ Stream info:", err.message);
     } finally {
         if (!res.writableEnded) res.end();
     }
