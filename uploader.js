@@ -4,11 +4,24 @@ import { Buffer } from 'buffer';
 
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
-const chatId = BigInt(process.env.TELEGRAM_CHANNEL_ID); 
-const botChatId = BigInt(process.env.BOT_CHANNEL_ID || chatId);
 const BOT_TOKEN = process.env.BOT_TOKEN; 
 
-// --- GESTIÓN DE BOTS ---
+// --- 🔧 AUTOCORRECTOR DE IDs (La solución al error CHANNEL_INVALID) ---
+// Convierte "123456" en "-100123456" automáticamente
+function fixId(id) {
+    if (!id) return BigInt(0);
+    let s = String(id).trim();
+    // Si ya tiene el formato correcto (-100...), lo dejamos igual
+    if (s.startsWith("-100")) return BigInt(s);
+    // Si tiene un guion simple o nada, le forzamos el formato de canal
+    return BigInt("-100" + s.replace(/-/g, ""));
+}
+
+// Aplicamos la corrección a los IDs
+const chatId = fixId(process.env.TELEGRAM_CHANNEL_ID); 
+const botChatId = process.env.BOT_CHANNEL_ID ? fixId(process.env.BOT_CHANNEL_ID) : chatId;
+
+// --- GESTIÓN DE BOTS (WORKERS) ---
 const workerTokens = (process.env.WORKER_TOKENS || "").split(",");
 const clients = [];
 let isConnecting = false;
@@ -21,19 +34,21 @@ async function initClients() {
     if (validTokens.length === 0) console.log("ℹ️ No WORKER_TOKENS. Usando fallback.");
     else console.log(`🚀 Iniciando Granja (${validTokens.length} bots)...`);
 
-    await Promise.all(validTokens.map(async (token) => {
+    await Promise.all(validTokens.map(async (token, idx) => {
         try {
             const client = new TelegramClient(new StringSession(""), apiId, apiHash, { connectionRetries: 5, useWSS: false });
             await client.start({ botAuthToken: token.trim() });
             clients.push(client);
-        } catch (e) { console.error("❌ Error Worker:", e.message); }
+            // Intentamos leer el canal para verificar acceso
+            try { await client.getMessages(chatId, { limit: 1 }); } catch(e){}
+        } catch (e) { console.error(`❌ Error Worker ${idx+1}:`, e.message); }
     }));
     isConnecting = false;
 }
 
 async function getWorker() {
     await initClients();
-    if (clients.length === 0) throw new Error("No workers available. Check WORKER_TOKENS");
+    if (clients.length === 0) throw new Error("No hay workers disponibles. Revisa WORKER_TOKENS");
     return clients[Math.floor(Math.random() * clients.length)];
 }
 
@@ -63,11 +78,13 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     }
 
     const inputFile = new Api.InputFileBig({ id: fileId, parts: partIndex, name: fileName });
+    // Usamos el ID corregido (chatId) que tiene el -100
     const res = await client.sendFile(chatId, { file: inputFile, forceDocument: true, caption: fileName });
+    
     return { telegram_id: await getTelegramFileId(res.id, chatId), message_id: res.id };
 }
 
-// --- STREAMING (512KB TURBO) ---
+// --- STREAMING ---
 export async function streamFile(messageId, res, range) {
     const client = await getWorker();
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
@@ -116,9 +133,7 @@ async function streamChunksToRes(client, location, res, requestedStart, requeste
             let limit = BASE_CHUNK;
             if (remaining < BigInt(BASE_CHUNK)) {
                 if (remaining <= 4096n) limit = 4096;
-                else if (remaining <= 8192n) limit = 8192;
                 else if (remaining <= 16384n) limit = 16384;
-                else if (remaining <= 32768n) limit = 32768;
                 else if (remaining <= 65536n) limit = 65536;
                 else if (remaining <= 131072n) limit = 131072;
                 else limit = 262144;
@@ -134,14 +149,21 @@ async function streamChunksToRes(client, location, res, requestedStart, requeste
             currentOffset += BigInt(result.bytes.length);
             if (result.bytes.length < limit) break;
         }
-    } catch (err) { console.warn("Stream warning:", err.message); } 
+    } catch (err) { console.warn("Stream:", err.message); } 
     finally { if (!res.writableEnded) res.end(); }
 }
 
 export async function uploadThumbnailBuffer(buffer) {
-    const client = await getWorker();
-    const res = await client.sendFile(botChatId, { file: buffer, forceDocument: false });
-    return await getTelegramFileId(res.id, botChatId);
+    // Si falla la miniatura, no detenemos la subida principal
+    try {
+        const client = await getWorker();
+        // Usamos el ID corregido (botChatId)
+        const res = await client.sendFile(botChatId, { file: buffer, forceDocument: false });
+        return await getTelegramFileId(res.id, botChatId);
+    } catch (e) {
+        console.error("❌ Error subiendo Miniatura:", e.message);
+        return null; 
+    }
 }
 
 export async function getFileUrl(fileId) {
@@ -149,7 +171,9 @@ export async function getFileUrl(fileId) {
     try { const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`); const d = await r.json(); if(d.ok) return `https://api.telegram.org/file/bot${BOT_TOKEN}/${d.result.file_path}`; } catch (e) {} return null;
 }
 
+// Esta función usa el BOT_TOKEN (El Jefe). Si el Jefe no es Admin, esto falla.
 async function getTelegramFileId(msgId, chId) {
     if(!BOT_TOKEN) return null;
-    try { const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:chId.toString(), from_chat_id:chId.toString(), message_id:msgId}) }); const d = await r.json(); if(d.ok) { await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:chId.toString(), message_id:d.result.message_id}) }); return d.result.document?.file_id || d.result.photo?.pop()?.file_id; } } catch(e){} return null;
+    const strChId = String(chId); // Convertimos el BigInt a String para la API HTTP
+    try { const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:strChId, from_chat_id:strChId, message_id:msgId}) }); const d = await r.json(); if(d.ok) { await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:strChId, message_id:d.result.message_id}) }); return d.result.document?.file_id || d.result.photo?.pop()?.file_id; } else { console.error("❌ Error ID:", d.description); } } catch(e){} return null;
 }
