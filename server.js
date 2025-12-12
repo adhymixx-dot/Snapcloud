@@ -50,6 +50,9 @@ app.post("/upload", authMiddleware, (req, res) => {
     const bb = busboy({ headers: req.headers });
     let vidP = null, thP = Promise.resolve(null);
     let fName = "", mime = "";
+    
+    // Capturamos el tamaño (IMPORTANTE PARA BARRA DE CARGA)
+    const fileSize = parseInt(req.headers['content-length'] || "0");
 
     bb.on('file', (name, file, info) => {
         if (name === "thumbnail") {
@@ -57,7 +60,7 @@ app.post("/upload", authMiddleware, (req, res) => {
             file.on('end', () => thP = uploadThumbnailBuffer(Buffer.concat(c)).catch(()=>null));
         } else if (name === "file") {
             fName = info.filename; mime = info.mimeType;
-            vidP = uploadFromStream(file, info.filename, parseInt(req.headers['content-length'] || "0"));
+            vidP = uploadFromStream(file, info.filename, fileSize);
         } else { file.resume(); }
     });
 
@@ -69,7 +72,7 @@ app.post("/upload", authMiddleware, (req, res) => {
             if (typeof tId === 'object') tId = JSON.stringify(tId);
 
             await supabase.from('files').insert([{
-                user_id: req.user.id, name: fName, mime: mime,
+                user_id: req.user.id, name: fName, mime: mime, size: fileSize,
                 thumbnail_id: tId ? String(tId) : null,
                 telegram_id: String(vid.telegram_id), message_id: String(vid.message_id)
             }]);
@@ -89,23 +92,15 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     res.json({ url });
 });
 
-// --- STREAMING (VISUALIZACIÓN) OPTIMIZADO ---
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
-        // Obtenemos info del archivo desde Supabase para saber el nombre y mime
         const { data: f } = await supabase.from('files').select('mime, name').eq('message_id', req.params.message_id).single();
-
-        // IMPORTANTE: Capturamos la cabecera 'range' que envía el navegador
         const range = req.headers.range;
-
         if (f) {
-            // Seteamos el nombre para descarga/visualización
+            res.setHeader('Content-Type', f.mime);
             res.setHeader('Content-Disposition', `inline; filename="${f.name}"`);
         }
-
-        // Llamamos a la nueva función streamFile pasando el rango
         await streamFile(req.params.message_id, res, range);
-
     } catch (error) {
         console.error("❌ Error Stream:", error);
         if (!res.headersSent) res.status(500).end();
