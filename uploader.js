@@ -6,7 +6,7 @@ const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
 const BOT_TOKEN = process.env.BOT_TOKEN; 
 
-// --- 🔧 AUTOCORRECTOR DE IDs (Vital para evitar CHANNEL_INVALID) ---
+// --- 🔧 AUTOCORRECTOR DE IDs ---
 function fixId(id) {
     if (!id) return BigInt(0);
     let s = String(id).trim();
@@ -33,10 +33,13 @@ async function initClients() {
 
     await Promise.all(validTokens.map(async (token, idx) => {
         try {
-            const client = new TelegramClient(new StringSession(""), apiId, apiHash, { connectionRetries: 5, useWSS: false });
+            const client = new TelegramClient(new StringSession(""), apiId, apiHash, { 
+                connectionRetries: 5, 
+                useWSS: false 
+            });
             await client.start({ botAuthToken: token.trim() });
             
-            // Saludo obligatorio al canal
+            // Saludo obligatorio para evitar errores de entidad
             try {
                 await client.invoke(new Api.channels.GetChannels({
                     id: [new Api.InputChannel({ channelId: bigIntToId(chatId), accessHash: BigInt(0) })] 
@@ -62,7 +65,7 @@ async function getWorker() {
     return clients[Math.floor(Math.random() * clients.length)];
 }
 
-// --- UPLOAD (Igual que tu código antiguo: 512KB para subir está bien) ---
+// --- UPLOAD (512KB como en tu archivo original) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     const client = await getWorker();
     const fileId = BigInt(Date.now());
@@ -119,7 +122,7 @@ export async function streamFile(messageId, res, range) {
     }
 
     const chunkLength = (end - start) + 1;
-    // Quitamos 'keep-alive' agresivo, volvemos a lo básico
+    // Quitamos 'keep-alive' agresivo, volvemos a lo básico que funcionaba
     res.writeHead(range ? 206 : 200, {
         'Content-Range': `bytes ${start}-${end}/${fileSize}`,
         'Accept-Ranges': 'bytes', 'Content-Length': chunkLength, 'Content-Type': mime
@@ -129,6 +132,7 @@ export async function streamFile(messageId, res, range) {
 }
 
 // --- NÚCLEO ORIGINAL DE TU ARCHIVO (64KB) ---
+// Esta es exactamente la lógica de tu archivo uploaded uploader.js
 async function streamChunksToRes(client, location, res, requestedStart, requestedEnd, totalFileSize) {
     let currentOffset = BigInt(requestedStart - (requestedStart % 4096));
     const end = BigInt(requestedEnd);
@@ -159,7 +163,7 @@ async function streamChunksToRes(client, location, res, requestedStart, requeste
             let chunk = result.bytes;
             if (initialSkip > 0) { chunk = chunk.slice(initialSkip); initialSkip = 0; }
 
-            // ESCRITURA SIMPLE (Sin lógica compleja de drain/backpressure)
+            // ESCRITURA SIMPLE (Sin lógica compleja de drain)
             // Esto es lo que funcionaba en tu código original
             res.write(chunk);
 
