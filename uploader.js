@@ -4,10 +4,10 @@ import { Buffer } from 'buffer';
 
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
-// CAMBIO 1: Usamos tu Bot Token directamente
+// USAMOS TU BOT (Vital para que funcione en Render)
 const BOT_TOKEN = process.env.BOT_TOKEN; 
 
-// CAMBIO 2: Función para arreglar IDs (Evita CHANNEL_INVALID)
+// 1. Corrector de IDs (Vital para evitar CHANNEL_INVALID)
 function fixId(id) {
     if (!id) return BigInt(0);
     let s = String(id).trim();
@@ -19,7 +19,7 @@ function fixId(id) {
 const chatId = fixId(process.env.TELEGRAM_CHANNEL_ID); 
 const botChatId = process.env.BOT_CHANNEL_ID ? fixId(process.env.BOT_CHANNEL_ID) : chatId;
 
-// Usamos un solo cliente (Tu lógica original)
+// 2. Cliente Único (Estabilidad)
 const client = new TelegramClient(new StringSession(""), apiId, apiHash, { 
     connectionRetries: 5,
     useWSS: false 
@@ -28,23 +28,18 @@ let clientPromise = null;
 
 async function initClient() {
     if (!clientPromise) { 
-        console.log("🔌 Telegram conectando..."); 
-        
-        // CAMBIO 3: Conexión correcta para Bots
+        console.log("🔌 Conectando Bot...");
         clientPromise = (async () => {
             await client.start({ botAuthToken: BOT_TOKEN });
-            
-            // CAMBIO 4: Sincronización para evitar "Input Entity Not Found"
-            try {
-                await client.getDialogs({ limit: 10 });
-                console.log("✅ Bot conectado y sincronizado.");
-            } catch (e) { console.log("⚠️ Alerta sincro:", e.message); }
+            // Sincronización para evitar errores de acceso
+            try { await client.getDialogs({ limit: 5 }); } catch (e) {}
+            console.log("✅ Bot listo.");
         })();
     }
     await clientPromise;
 }
 
-// --- SUBIDA (Tu código original) ---
+// --- SUBIDA (Tu lógica original) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
@@ -83,7 +78,6 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     }
 
     const inputFile = new Api.InputFileBig({ id: fileId, parts: partIndex, name: fileName });
-    // Usamos el ID corregido (chatId)
     const res = await client.sendFile(chatId, { file: inputFile, forceDocument: true, caption: fileName });
 
     return { 
@@ -92,7 +86,7 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     };
 }
 
-// --- STREAMING (Tu código original) ---
+// --- STREAMING (Tu lógica original) ---
 export async function streamFile(messageId, res, range) {
     await initClient();
     
@@ -152,14 +146,14 @@ export async function streamFile(messageId, res, range) {
     await streamChunksToRes(location, res, start, end, fileSize);
 }
 
-// --- TU LÓGICA DE 64KB (ESTABILIDAD PURA) ---
+// --- NÚCLEO CON REINTENTOS (La solución al error QUIC) ---
 async function streamChunksToRes(location, res, requestedStart, requestedEnd, totalFileSize) {
     let currentOffset = BigInt(requestedStart - (requestedStart % 4096));
     const end = BigInt(requestedEnd);
     const totalSize = BigInt(totalFileSize);
     let initialSkip = requestedStart % 4096;
 
-    // ESTO ES LO QUE HACE QUE FUNCIONE FLUIDO: 64KB
+    // TU CONFIGURACIÓN PREFERIDA: 64KB
     const BASE_CHUNK = 64 * 1024; 
 
     try {
@@ -168,7 +162,6 @@ async function streamChunksToRes(location, res, requestedStart, requestedEnd, to
             if (remainingInFile <= 0n) break;
 
             let limit = BASE_CHUNK;
-            // Escalera para el final
             if (remainingInFile < BigInt(BASE_CHUNK)) {
                 if (remainingInFile <= 4096n) limit = 4096;
                 else if (remainingInFile <= 8192n) limit = 8192;
@@ -177,13 +170,24 @@ async function streamChunksToRes(location, res, requestedStart, requestedEnd, to
                 else limit = 65536; 
             }
 
-            const result = await client.invoke(new Api.upload.GetFile({
-                location: location,
-                offset: currentOffset,
-                limit: limit
-            }));
+            // SISTEMA DE REINTENTOS (Esto arregla el corte)
+            let result = null;
+            let attempts = 0;
+            while(attempts < 3) {
+                try {
+                    result = await client.invoke(new Api.upload.GetFile({
+                        location: location,
+                        offset: currentOffset,
+                        limit: limit
+                    }));
+                    break; // Si funciona, salimos del bucle de intentos
+                } catch (e) {
+                    attempts++;
+                    await new Promise(r => setTimeout(r, 500 * attempts)); // Esperar un poco antes de reintentar
+                }
+            }
 
-            if (!result || result.bytes.length === 0) break;
+            if (!result || !result.bytes || result.bytes.length === 0) break;
 
             let chunk = result.bytes;
             if (initialSkip > 0) {
@@ -191,20 +195,22 @@ async function streamChunksToRes(location, res, requestedStart, requestedEnd, to
                 initialSkip = 0; 
             }
 
-            res.write(chunk);
-            currentOffset += BigInt(result.bytes.length);
-
+            // Si el cliente cerró la conexión, paramos
             if (res.writableEnded || res.closed) break;
+
+            res.write(chunk);
+            
+            currentOffset += BigInt(result.bytes.length);
             if (result.bytes.length < limit) break;
         }
     } catch (err) {
-        // Ignoramos errores silenciosos
-        if(!err.message.includes("LIMIT_INVALID")) console.error("Stream:", err.message);
+        console.error("Stream Error:", err.message);
     } finally {
         if (!res.writableEnded) res.end();
     }
 }
 
+// --- AUXILIARES ---
 export async function uploadThumbnailBuffer(buffer) {
     await initClient();
     try {

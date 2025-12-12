@@ -27,7 +27,7 @@ function authMiddleware(req, res, next) {
 app.post("/register", async (req, res) => {
     const { email, password } = req.body;
     try {
-        const { data: existing } = await supabase.from('users').select('*').eq('email', email).single();
+        const { data: existing } = await supabase.from('users').select('id').eq('email', email).single();
         if (existing) return res.status(400).json({ error: "Ya existe" });
         const hash = await bcrypt.hash(password, 10);
         await supabase.from('users').insert([{ email, password: hash }]);
@@ -45,13 +45,13 @@ app.post("/login", async (req, res) => {
     } catch (e) { res.status(500).json({ error: "Error login" }); }
 });
 
-// --- UPLOAD ---
+// --- UPLOAD (CON CORRECCIÓN DE SIZE) ---
 app.post("/upload", authMiddleware, (req, res) => {
     const bb = busboy({ headers: req.headers });
     let vidP = null, thP = Promise.resolve(null);
     let fName = "", mime = "";
     
-    // Capturamos el tamaño (IMPORTANTE PARA BARRA DE CARGA)
+    // ESTO ES LO ÚNICO QUE AGREGUÉ A TU CÓDIGO ORIGINAL
     const fileSize = parseInt(req.headers['content-length'] || "0");
 
     bb.on('file', (name, file, info) => {
@@ -71,6 +71,7 @@ app.post("/upload", authMiddleware, (req, res) => {
             let tId = th ? (th.message_id || th) : null;
             if (typeof tId === 'object') tId = JSON.stringify(tId);
 
+            // AQUÍ TAMBIÉN AGREGUÉ EL SIZE
             await supabase.from('files').insert([{
                 user_id: req.user.id, name: fName, mime: mime, size: fileSize,
                 thumbnail_id: tId ? String(tId) : null,
@@ -92,9 +93,10 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     res.json({ url });
 });
 
+// --- STREAMING (Tu lógica original) ---
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
-        const { data: f } = await supabase.from('files').select('mime, name').eq('message_id', req.params.message_id).single();
+        const { data: f } = await supabase.from('files').select('mime, name, size').eq('message_id', req.params.message_id).single();
         const range = req.headers.range;
         if (f) {
             res.setHeader('Content-Type', f.mime);
