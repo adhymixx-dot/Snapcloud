@@ -28,30 +28,30 @@ app.post("/register", async (req, res) => {
     const { email, password } = req.body;
     try {
         const { data: existing } = await supabase.from('users').select('id').eq('email', email).single();
-        if (existing) return res.status(400).json({ error: "Email ocupado" });
+        if (existing) return res.status(400).json({ error: "Ya existe" });
         const hash = await bcrypt.hash(password, 10);
         await supabase.from('users').insert([{ email, password: hash }]);
         res.json({ ok: true });
-    } catch (e) { res.status(500).json({ error: "Error interno" }); }
+    } catch (e) { res.status(500).json({ error: "Error registro" }); }
 });
 
 app.post("/login", async (req, res) => {
     const { email, password } = req.body;
     try {
         const { data: user } = await supabase.from('users').select('*').eq('email', email).single();
-        if (!user || !await bcrypt.compare(password, user.password)) return res.status(400).json({ error: "Datos incorrectos" });
+        if (!user || !await bcrypt.compare(password, user.password)) return res.status(400).json({ error: "Error login" });
         const token = jwt.sign({ id: user.id }, JWT_SECRET);
         res.json({ ok: true, token });
     } catch (e) { res.status(500).json({ error: "Error login" }); }
 });
 
-// --- UPLOAD BLINDADO (Sin duplicados) ---
+// --- UPLOAD (CON MEJORA DE SIZE) ---
 app.post("/upload", authMiddleware, (req, res) => {
     const bb = busboy({ headers: req.headers });
     let vidP = null, thP = Promise.resolve(null);
     let fName = "", mime = "";
-    let fileProcessed = false; // CANDADO IMPORTANTE
     
+    // Capturamos el tamaño
     const fileSize = parseInt(req.headers['content-length'] || "0");
 
     bb.on('file', (name, file, info) => {
@@ -59,10 +59,6 @@ app.post("/upload", authMiddleware, (req, res) => {
             const c = []; file.on('data', d => c.push(d));
             file.on('end', () => thP = uploadThumbnailBuffer(Buffer.concat(c)).catch(()=>null));
         } else if (name === "file") {
-            // SI YA ESTAMOS PROCESANDO UN ARCHIVO, IGNORAMOS CUALQUIER OTRA COSA QUE VENGA DESPUÉS
-            if (fileProcessed) return file.resume();
-            fileProcessed = true;
-
             fName = info.filename; mime = info.mimeType;
             vidP = uploadFromStream(file, info.filename, fileSize);
         } else { file.resume(); }
@@ -75,12 +71,12 @@ app.post("/upload", authMiddleware, (req, res) => {
             let tId = th ? (th.message_id || th) : null;
             if (typeof tId === 'object') tId = JSON.stringify(tId);
 
-            const { error } = await supabase.from('files').insert([{
+            // Guardamos el SIZE para la barra de progreso
+            await supabase.from('files').insert([{
                 user_id: req.user.id, name: fName, mime: mime, size: fileSize,
                 thumbnail_id: tId ? String(tId) : null,
                 telegram_id: String(vid.telegram_id), message_id: String(vid.message_id)
             }]);
-            if(error) throw error;
             res.json({ ok: true });
         } catch (e) { console.error(e); if(!res.headersSent) res.status(500).json({ error: e.message }); }
     });
@@ -97,6 +93,7 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     res.json({ url });
 });
 
+// --- STREAMING ---
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
         const { data: f } = await supabase.from('files').select('mime, name, size').eq('message_id', req.params.message_id).single();
@@ -106,8 +103,10 @@ app.get("/stream/:message_id", authMiddleware, async (req, res) => {
             res.setHeader('Content-Disposition', `inline; filename="${f.name}"`);
         }
         await streamFile(req.params.message_id, res, range);
-    } catch (error) { console.error(error); if (!res.headersSent) res.status(500).end(); }
+    } catch (error) {
+        console.error("❌ Error Stream:", error);
+        if (!res.headersSent) res.status(500).end();
+    }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server Ready on port ${PORT}`));
+app.listen(process.env.PORT || 3000, () => console.log("🚀 Server Ready"));

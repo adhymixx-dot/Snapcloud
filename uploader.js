@@ -6,7 +6,7 @@ const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
 const BOT_TOKEN = process.env.BOT_TOKEN; 
 
-// --- 🔧 AUTOCORRECTOR DE IDs ---
+// --- 🔧 AUTOCORRECTOR DE IDs (Vital para evitar CHANNEL_INVALID) ---
 function fixId(id) {
     if (!id) return BigInt(0);
     let s = String(id).trim();
@@ -36,7 +36,7 @@ async function initClients() {
             const client = new TelegramClient(new StringSession(""), apiId, apiHash, { connectionRetries: 5, useWSS: false });
             await client.start({ botAuthToken: token.trim() });
             
-            // Saludo obligatorio para evitar errores de entidad
+            // Saludo obligatorio al canal
             try {
                 await client.invoke(new Api.channels.GetChannels({
                     id: [new Api.InputChannel({ channelId: bigIntToId(chatId), accessHash: BigInt(0) })] 
@@ -62,11 +62,11 @@ async function getWorker() {
     return clients[Math.floor(Math.random() * clients.length)];
 }
 
-// --- UPLOAD ---
+// --- UPLOAD (Igual que tu código antiguo: 512KB para subir está bien) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     const client = await getWorker();
     const fileId = BigInt(Date.now());
-    const PART_SIZE = 128 * 1024; // 128KB para subida segura
+    const PART_SIZE = 512 * 1024;
     const totalParts = fileSize > 0 ? Math.ceil(fileSize / PART_SIZE) : -1;
 
     console.log(`🌊 Subiendo: ${fileName}`);
@@ -93,7 +93,7 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     return { telegram_id: await getTelegramFileId(res.id, chatId), message_id: res.id };
 }
 
-// --- STREAMING (SIN LATENCIA) ---
+// --- STREAMING (LÓGICA RESTAURADA A 64KB) ---
 export async function streamFile(messageId, res, range) {
     const client = await getWorker();
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
@@ -119,6 +119,7 @@ export async function streamFile(messageId, res, range) {
     }
 
     const chunkLength = (end - start) + 1;
+    // Quitamos 'keep-alive' agresivo, volvemos a lo básico
     res.writeHead(range ? 206 : 200, {
         'Content-Range': `bytes ${start}-${end}/${fileSize}`,
         'Accept-Ranges': 'bytes', 'Content-Length': chunkLength, 'Content-Type': mime
@@ -127,55 +128,42 @@ export async function streamFile(messageId, res, range) {
     await streamChunksToRes(client, location, res, start, end, fileSize);
 }
 
-// --- NÚCLEO DE TRANSMISIÓN DIRECTA ---
+// --- NÚCLEO ORIGINAL DE TU ARCHIVO (64KB) ---
 async function streamChunksToRes(client, location, res, requestedStart, requestedEnd, totalFileSize) {
     let currentOffset = BigInt(requestedStart - (requestedStart % 4096));
     const end = BigInt(requestedEnd);
     const totalSize = BigInt(totalFileSize);
     let initialSkip = requestedStart % 4096;
     
-    // 128KB: Tamaño nativo de Telegram. Es el más rápido porque no requiere conversión.
-    const CHUNK_SIZE = 128 * 1024; 
+    // VOLVEMOS A 64KB (Estabilidad pura, como en tu código original)
+    const BASE_CHUNK = 64 * 1024; 
 
     try {
         while (currentOffset <= end) {
             const remaining = totalSize - currentOffset;
             if (remaining <= 0n) break;
             
-            // Lógica Escalera para Telegram (Evita LIMIT_INVALID)
-            let limit = CHUNK_SIZE;
-            if (remaining < BigInt(CHUNK_SIZE)) {
+            let limit = BASE_CHUNK;
+            // Lógica de Escalera Original
+            if (remaining < BigInt(BASE_CHUNK)) {
                 if (remaining <= 4096n) limit = 4096;
-                else if (remaining <= 16384n) limit = 16384; 
+                else if (remaining <= 8192n) limit = 8192;
+                else if (remaining <= 16384n) limit = 16384;
                 else if (remaining <= 32768n) limit = 32768;
-                else if (remaining <= 65536n) limit = 65536;
-                else limit = 131072;
+                else limit = 65536;
             }
 
-            // Descarga de Telegram
             const result = await client.invoke(new Api.upload.GetFile({ location, offset: currentOffset, limit }));
             if (!result || !result.bytes.length) break;
 
             let chunk = result.bytes;
-            
-            // Recorte inicial si fue necesario alinear
-            if (initialSkip > 0) { 
-                chunk = chunk.slice(initialSkip); 
-                initialSkip = 0; 
-            }
+            if (initialSkip > 0) { chunk = chunk.slice(initialSkip); initialSkip = 0; }
 
-            // --- CAMBIO CLAVE: ENVÍO INMEDIATO ---
-            // No acumulamos buffer. Enviamos lo que llega al instante.
-            const canContinue = res.write(chunk);
-            
-            // Si el navegador se llena, esperamos (Backpressure)
-            if (!canContinue) {
-                // Pausamos la descarga de Telegram hasta que el navegador respire
-                await new Promise(resolve => res.once('drain', resolve));
-            }
+            // ESCRITURA SIMPLE (Sin lógica compleja de drain/backpressure)
+            // Esto es lo que funcionaba en tu código original
+            res.write(chunk);
 
             currentOffset += BigInt(result.bytes.length);
-
             if (res.writableEnded || res.closed) break;
             if (result.bytes.length < limit) break;
         }
