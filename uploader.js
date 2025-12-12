@@ -65,7 +65,7 @@ async function getWorker() {
     return clients[Math.floor(Math.random() * clients.length)];
 }
 
-// --- UPLOAD (512KB como en tu archivo original) ---
+// --- UPLOAD (512KB para subir está bien, no afecta la reproducción) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     const client = await getWorker();
     const fileId = BigInt(Date.now());
@@ -96,7 +96,7 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     return { telegram_id: await getTelegramFileId(res.id, chatId), message_id: res.id };
 }
 
-// --- STREAMING (LÓGICA RESTAURADA A 64KB) ---
+// --- STREAMING (LÓGICA RESTAURADA A 64KB - LA QUE FUNCIONABA) ---
 export async function streamFile(messageId, res, range) {
     const client = await getWorker();
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
