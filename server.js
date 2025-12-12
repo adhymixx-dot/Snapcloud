@@ -27,7 +27,7 @@ function authMiddleware(req, res, next) {
 app.post("/register", async (req, res) => {
     const { email, password } = req.body;
     try {
-        const { data: existing } = await supabase.from('users').select('id').eq('email', email).single();
+        const { data: existing } = await supabase.from('users').select('*').eq('email', email).single();
         if (existing) return res.status(400).json({ error: "Ya existe" });
         const hash = await bcrypt.hash(password, 10);
         await supabase.from('users').insert([{ email, password: hash }]);
@@ -50,7 +50,6 @@ app.post("/upload", authMiddleware, (req, res) => {
     const bb = busboy({ headers: req.headers });
     let vidP = null, thP = Promise.resolve(null);
     let fName = "", mime = "";
-    const fileSize = parseInt(req.headers['content-length'] || "0");
 
     bb.on('file', (name, file, info) => {
         if (name === "thumbnail") {
@@ -58,7 +57,7 @@ app.post("/upload", authMiddleware, (req, res) => {
             file.on('end', () => thP = uploadThumbnailBuffer(Buffer.concat(c)).catch(()=>null));
         } else if (name === "file") {
             fName = info.filename; mime = info.mimeType;
-            vidP = uploadFromStream(file, info.filename, fileSize);
+            vidP = uploadFromStream(file, info.filename, parseInt(req.headers['content-length'] || "0"));
         } else { file.resume(); }
     });
 
@@ -70,7 +69,7 @@ app.post("/upload", authMiddleware, (req, res) => {
             if (typeof tId === 'object') tId = JSON.stringify(tId);
 
             await supabase.from('files').insert([{
-                user_id: req.user.id, name: fName, mime: mime, size: fileSize,
+                user_id: req.user.id, name: fName, mime: mime,
                 thumbnail_id: tId ? String(tId) : null,
                 telegram_id: String(vid.telegram_id), message_id: String(vid.message_id)
             }]);
@@ -90,15 +89,23 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     res.json({ url });
 });
 
+// --- STREAMING (VISUALIZACIÓN) OPTIMIZADO ---
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
-        const { data: f } = await supabase.from('files').select('mime, name, size').eq('message_id', req.params.message_id).single();
+        // Obtenemos info del archivo desde Supabase para saber el nombre y mime
+        const { data: f } = await supabase.from('files').select('mime, name').eq('message_id', req.params.message_id).single();
+
+        // IMPORTANTE: Capturamos la cabecera 'range' que envía el navegador
         const range = req.headers.range;
+
         if (f) {
-            res.setHeader('Content-Type', f.mime);
+            // Seteamos el nombre para descarga/visualización
             res.setHeader('Content-Disposition', `inline; filename="${f.name}"`);
         }
+
+        // Llamamos a la nueva función streamFile pasando el rango
         await streamFile(req.params.message_id, res, range);
+
     } catch (error) {
         console.error("❌ Error Stream:", error);
         if (!res.headersSent) res.status(500).end();
