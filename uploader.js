@@ -4,50 +4,23 @@ import { Buffer } from 'buffer';
 
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
-// CAMBIO 1: Usamos BOT_TOKEN en lugar de SESSION
-const BOT_TOKEN = process.env.BOT_TOKEN; 
+const session = new StringSession(process.env.TELEGRAM_SESSION);
+const chatId = BigInt(process.env.TELEGRAM_CHANNEL_ID); 
+const botChatId = BigInt(process.env.BOT_CHANNEL_ID || chatId);
+const BOT_TOKEN = process.env.BOT_TOKEN;
 
-// CAMBIO 2: Corrector de IDs para evitar el error CHANNEL_INVALID
-function fixId(id) {
-    if (!id) return BigInt(0);
-    let s = String(id).trim();
-    if (s.startsWith("-100")) return BigInt(s);
-    if (s.startsWith("-")) return BigInt("-100" + s.substring(1));
-    return BigInt("-100" + s);
-}
-
-const chatId = fixId(process.env.TELEGRAM_CHANNEL_ID); 
-const botChatId = process.env.BOT_CHANNEL_ID ? fixId(process.env.BOT_CHANNEL_ID) : chatId;
-
-// Creamos el cliente (Configuración estándar)
-const client = new TelegramClient(new StringSession(""), apiId, apiHash, { 
-    connectionRetries: 5 
-});
+const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
 let clientPromise = null;
 
 async function initClient() {
     if (!clientPromise) { 
         console.log("🔌 Telegram conectando..."); 
-        
-        // CAMBIO 3: Conectamos usando el BOT_TOKEN
-        clientPromise = (async () => {
-            await client.start({
-                botAuthToken: BOT_TOKEN
-            });
-            
-            // CAMBIO 4: Sincronización OBLIGATORIA para evitar error "Input Entity Not Found"
-            // El bot saluda al canal para obtener las credenciales de acceso.
-            try {
-                await client.getDialogs({ limit: 10 });
-            } catch (e) {
-                console.log("⚠️ Sincronización de diálogos omitida:", e.message);
-            }
-        })();
+        clientPromise = client.connect(); 
     }
     await clientPromise;
 }
 
-// --- SUBIDA (Tu lógica original de 512KB) ---
+// --- SUBIDA (Sin cambios) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
@@ -86,7 +59,6 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     }
 
     const inputFile = new Api.InputFileBig({ id: fileId, parts: partIndex, name: fileName });
-    // Usamos el ID corregido (chatId)
     const res = await client.sendFile(chatId, { file: inputFile, forceDocument: true, caption: fileName });
 
     return { 
@@ -95,7 +67,7 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     };
 }
 
-// --- STREAMING (Tu lógica original de 64KB) ---
+// --- VISUALIZACIÓN QUIRÚRGICA ---
 export async function streamFile(messageId, res, range) {
     await initClient();
     
@@ -165,70 +137,81 @@ export async function streamFile(messageId, res, range) {
     await streamChunksToRes(location, res, start, end, fileSize);
 }
 
-// --- TU FUNCIÓN NÚCLEO ORIGINAL (64KB) ---
+// --- FUNCIÓN DE DESCARGA SEGURA ---
 async function streamChunksToRes(location, res, requestedStart, requestedEnd, totalFileSize) {
+    // Alinear el inicio al bloque de 4KB anterior (Telegram es estricto con esto)
+    // Si el navegador pide byte 100, pedimos desde el 0 y cortamos luego.
     let currentOffset = BigInt(requestedStart - (requestedStart % 4096));
     const end = BigInt(requestedEnd);
     const totalSize = BigInt(totalFileSize);
+
+    // Calcular bytes a saltar en el primer chunk si el offset no era exacto
     let initialSkip = requestedStart % 4096;
 
-    // ESTA ES LA CLAVE DE TU ESTABILIDAD: 64KB
+    // Tamaño base seguro: 64KB (Potencia de 2, rápido y compatible)
     const BASE_CHUNK = 64 * 1024; 
 
     try {
         while (currentOffset <= end) {
+            // Cuánto falta en el ARCHIVO REAL
             const remainingInFile = totalSize - currentOffset;
             if (remainingInFile <= 0n) break;
 
+            // Determinar límite: Usar BASE_CHUNK a menos que estemos al final
             let limit = BASE_CHUNK;
-            // Lógica de Escalera Original
+
+            // Lógica de "Escalera" para el final del archivo
+            // Si queda menos de 64KB, usamos potencias de 2 decrecientes
             if (remainingInFile < BigInt(BASE_CHUNK)) {
                 if (remainingInFile <= 4096n) limit = 4096;
                 else if (remainingInFile <= 8192n) limit = 8192;
                 else if (remainingInFile <= 16384n) limit = 16384;
                 else if (remainingInFile <= 32768n) limit = 32768;
-                else limit = 65536; 
+                else limit = 65536; // 64KB fallback
             }
 
+            // Llamada a API
             const result = await client.invoke(new Api.upload.GetFile({
                 location: location,
                 offset: currentOffset,
                 limit: limit
             }));
 
-            if (!result || !result.bytes.length) break;
+            if (!result || result.bytes.length === 0) break;
 
             let chunk = result.bytes;
 
+            // Si es el primer chunk y tuvimos que alinear hacia atrás, cortamos lo sobrante
             if (initialSkip > 0) {
                 chunk = chunk.slice(initialSkip);
-                initialSkip = 0; 
+                initialSkip = 0; // Solo se hace una vez
             }
 
-            // Escritura simple sin pausas (Tu lógica original)
+            // Escribir al cliente
             res.write(chunk);
             
+            // Avanzar offset basado en lo que realmente descargamos de Telegram
+            // (IMPORTANTE: Usamos el tamaño sin cortar para el offset de Telegram)
             currentOffset += BigInt(result.bytes.length);
 
             if (res.writableEnded || res.closed) break;
+            
+            // Si Telegram devolvió menos de lo pedido, asumimos fin de archivo
             if (result.bytes.length < limit) break;
         }
     } catch (err) {
-        // Ignoramos errores menores de desconexión
-        if(!err.message.includes("LIMIT_INVALID")) console.error("⚠️ Stream Warning:", err.message);
+        console.error("⚠️ Stream Warning:", err.message);
+        // No lanzamos error fatal para que el navegador maneje el corte si es necesario
     } finally {
         if (!res.writableEnded) res.end();
     }
 }
 
-// --- AUXILIARES CON BOT TOKEN ---
+// --- AUXILIARES (Sin cambios) ---
 export async function uploadThumbnailBuffer(buffer) {
     await initClient();
-    try {
-        // Usamos el ID corregido (botChatId)
-        const res = await client.sendFile(botChatId, { file: buffer, forceDocument: false });
-        return await getTelegramFileId(res.id, botChatId);
-    } catch(e) { return null; }
+    const res = await client.sendFile(botChatId, { file: buffer, forceDocument: false });
+    return await getTelegramFileId(res.id, botChatId);
 }
 
 export async function getFileUrl(fileId) {
@@ -243,12 +226,11 @@ export async function getFileUrl(fileId) {
 
 async function getTelegramFileId(msgId, chId) {
     if(!BOT_TOKEN) return null;
-    const strChId = String(chId); // Importante: Convertir a String para la API HTTP
     try {
-        const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:strChId, from_chat_id:strChId, message_id:msgId}) });
+        const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:chId.toString(), from_chat_id:chId.toString(), message_id:msgId}) });
         const d = await res.json();
         if(d.ok) {
-            await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:strChId, message_id:d.result.message_id}) });
+            await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:chId.toString(), message_id:d.result.message_id}) });
             return d.result.document?.file_id || d.result.photo?.pop()?.file_id;
         }
     } catch(e){} return null;
