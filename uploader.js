@@ -67,11 +67,11 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     };
 }
 
-// --- VISUALIZACIÓN OPTIMIZADA (PIPELINING) ---
+// --- VISUALIZACIÓN ESTABLE (Sin Pipelining) ---
 export async function streamFile(req, messageId, res, range) {
     await initClient();
     
-    // 1. Obtener Info del archivo
+    // 1. Obtener Info
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
     if (!msgs || !msgs[0]) throw new Error("Mensaje no encontrado");
     const msg = msgs[0];
@@ -119,81 +119,72 @@ export async function streamFile(req, messageId, res, range) {
 
     const chunksize = (end - start) + 1;
     
-    // Cabeceras correctas para streaming
     res.writeHead(206, {
         'Content-Range': `bytes ${start}-${end}/${fileSize}`,
         'Accept-Ranges': 'bytes',
         'Content-Length': chunksize,
         'Content-Type': mimeType,
+        'Connection': 'keep-alive' // Ayuda a mantener la conexión abierta
     });
 
-    // Iniciar el stream con Turbo Pipelining
     await streamChunksToRes(req, location, res, start, end, fileSize);
 }
 
-// LÓGICA DE PRE-CARGA (PIPELINING)
+// --- DESCARGA SEGURA (Secuencial) ---
 async function streamChunksToRes(req, location, res, requestedStart, requestedEnd, totalFileSize) {
     let currentOffset = BigInt(requestedStart - (requestedStart % 4096));
     const end = BigInt(requestedEnd);
     let initialSkip = requestedStart % 4096;
 
-    // 512KB: Equilibrio perfecto velocidad/estabilidad
+    // Mantenemos 512KB porque es el equilibrio ideal
     const CHUNK_SIZE = 512 * 1024; 
 
-    // Detectar si el usuario cancela la carga
     let isAborted = false;
-    req.on("close", () => { isAborted = true; });
-
-    // 1. Lanzar la primera petición YA
-    let nextChunkPromise = client.invoke(new Api.upload.GetFile({
-        location: location,
-        offset: currentOffset,
-        limit: CHUNK_SIZE
-    })).catch(err => null);
+    // Manejo robusto de cierre
+    const onClose = () => { isAborted = true; };
+    req.on("close", onClose);
+    res.on("close", onClose);
+    res.on("error", onClose);
 
     try {
         while (currentOffset <= end) {
+            // Verificar ANTES de pedir a Telegram
             if (isAborted || res.writableEnded || res.closed) break;
 
-            // 2. Esperar el bloque actual
-            const result = await nextChunkPromise;
-            
+            // Petición síncrona (esperamos a que llegue antes de seguir)
+            // Esto evita el ERR_QUIC_PROTOCOL_ERROR por saturación
+            const result = await client.invoke(new Api.upload.GetFile({
+                location: location,
+                offset: currentOffset,
+                limit: CHUNK_SIZE
+            }));
+
             if (!result || !result.bytes || result.bytes.length === 0) break;
 
-            const chunk = result.bytes;
-            const fetchedBytes = result.bytes.length;
+            let chunk = result.bytes;
 
-            // 3. PRE-CARGA: Pedir el SIGUIENTE bloque mientras procesamos este
-            const nextOffset = currentOffset + BigInt(fetchedBytes);
-            
-            if (fetchedBytes === CHUNK_SIZE && nextOffset <= end && !isAborted) {
-                nextChunkPromise = client.invoke(new Api.upload.GetFile({
-                    location: location,
-                    offset: nextOffset,
-                    limit: CHUNK_SIZE
-                })).catch(err => null);
-            } else {
-                nextChunkPromise = Promise.resolve(null);
-            }
-
-            // 4. Enviar datos al usuario
-            let chunkToSend = chunk;
+            // Cortar sobrante inicial
             if (initialSkip > 0) {
-                chunkToSend = chunk.slice(initialSkip);
+                chunk = chunk.slice(initialSkip);
                 initialSkip = 0;
             }
 
-            if (!isAborted && !res.closed) {
-                res.write(chunkToSend);
-            }
+            // Verificar DESPUÉS de recibir (por si el usuario canceló mientras descargábamos)
+            if (isAborted || res.closed) break;
 
-            currentOffset += BigInt(fetchedBytes);
+            // Escribir al cliente
+            const canWrite = res.write(chunk);
+            
+            // Opcional: Si el buffer de Node está lleno, podríamos esperar (pero para video simple no suele hacer falta)
+            
+            currentOffset += BigInt(result.bytes.length);
 
-            if (fetchedBytes < CHUNK_SIZE) break;
+            if (result.bytes.length < CHUNK_SIZE) break;
         }
     } catch (err) {
         if (!isAborted) console.error("⚠️ Stream Error:", err.message);
     } finally {
+        req.removeListener("close", onClose); // Limpieza de listeners
         if (!res.writableEnded && !res.closed) res.end();
     }
 }
