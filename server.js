@@ -89,25 +89,24 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     res.json({ url });
 });
 
-// --- STREAMING (VISUALIZACIÓN) OPTIMIZADO ---
+// --- STREAMING (OPTIMIZADO) ---
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
-        // Obtenemos info del archivo desde Supabase para saber el nombre y mime
         const { data: f } = await supabase.from('files').select('mime, name').eq('message_id', req.params.message_id).single();
-
-        // IMPORTANTE: Capturamos la cabecera 'range' que envía el navegador
         const range = req.headers.range;
 
         if (f) {
-            // Seteamos el nombre para descarga/visualización
             res.setHeader('Content-Disposition', `inline; filename="${f.name}"`);
         }
 
-        // Llamamos a la nueva función streamFile pasando el rango
-        await streamFile(req.params.message_id, res, range);
+        // Pasamos 'req' para manejar cancelaciones (usuario cierra pestaña)
+        await streamFile(req, req.params.message_id, res, range);
 
     } catch (error) {
-        console.error("❌ Error Stream:", error);
+        // Ignoramos errores de conexión cortada por el cliente
+        if (error.code !== 'ECONNRESET' && error.message !== 'Aborted') {
+            console.error("❌ Error Stream:", error);
+        }
         if (!res.headersSent) res.status(500).end();
     }
 });

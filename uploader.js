@@ -20,7 +20,7 @@ async function initClient() {
     await clientPromise;
 }
 
-// --- SUBIDA (Sin cambios) ---
+// --- SUBIDA (Estándar) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
@@ -67,11 +67,11 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     };
 }
 
-// --- VISUALIZACIÓN QUIRÚRGICA ---
-export async function streamFile(messageId, res, range) {
+// --- VISUALIZACIÓN OPTIMIZADA (PIPELINING) ---
+export async function streamFile(req, messageId, res, range) {
     await initClient();
     
-    // 1. Info del archivo
+    // 1. Obtener Info del archivo
     const msgs = await client.getMessages(chatId, { ids: [Number(messageId)] });
     if (!msgs || !msgs[0]) throw new Error("Mensaje no encontrado");
     const msg = msgs[0];
@@ -118,96 +118,87 @@ export async function streamFile(messageId, res, range) {
     }
 
     const chunksize = (end - start) + 1;
-    console.log(`🎬 Stream: ${start}-${end} (Total: ${fileSize})`);
+    
+    // Cabeceras correctas para streaming
+    res.writeHead(206, {
+        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunksize,
+        'Content-Type': mimeType,
+    });
 
-    if (range) {
-        res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-            'Accept-Ranges': 'bytes',
-            'Content-Length': chunksize,
-            'Content-Type': mimeType,
-        });
-    } else {
-        res.writeHead(200, {
-            'Content-Length': fileSize,
-            'Content-Type': mimeType,
-        });
-    }
-
-    await streamChunksToRes(location, res, start, end, fileSize);
+    // Iniciar el stream con Turbo Pipelining
+    await streamChunksToRes(req, location, res, start, end, fileSize);
 }
 
-// --- FUNCIÓN DE DESCARGA SEGURA ---
-async function streamChunksToRes(location, res, requestedStart, requestedEnd, totalFileSize) {
-    // Alinear el inicio al bloque de 4KB anterior (Telegram es estricto con esto)
-    // Si el navegador pide byte 100, pedimos desde el 0 y cortamos luego.
+// LÓGICA DE PRE-CARGA (PIPELINING)
+async function streamChunksToRes(req, location, res, requestedStart, requestedEnd, totalFileSize) {
     let currentOffset = BigInt(requestedStart - (requestedStart % 4096));
     const end = BigInt(requestedEnd);
-    const totalSize = BigInt(totalFileSize);
-
-    // Calcular bytes a saltar en el primer chunk si el offset no era exacto
     let initialSkip = requestedStart % 4096;
 
-    // Tamaño base seguro: 64KB (Potencia de 2, rápido y compatible)
-    const BASE_CHUNK = 64 * 1024; 
+    // 512KB: Equilibrio perfecto velocidad/estabilidad
+    const CHUNK_SIZE = 512 * 1024; 
+
+    // Detectar si el usuario cancela la carga
+    let isAborted = false;
+    req.on("close", () => { isAborted = true; });
+
+    // 1. Lanzar la primera petición YA
+    let nextChunkPromise = client.invoke(new Api.upload.GetFile({
+        location: location,
+        offset: currentOffset,
+        limit: CHUNK_SIZE
+    })).catch(err => null);
 
     try {
         while (currentOffset <= end) {
-            // Cuánto falta en el ARCHIVO REAL
-            const remainingInFile = totalSize - currentOffset;
-            if (remainingInFile <= 0n) break;
+            if (isAborted || res.writableEnded || res.closed) break;
 
-            // Determinar límite: Usar BASE_CHUNK a menos que estemos al final
-            let limit = BASE_CHUNK;
+            // 2. Esperar el bloque actual
+            const result = await nextChunkPromise;
+            
+            if (!result || !result.bytes || result.bytes.length === 0) break;
 
-            // Lógica de "Escalera" para el final del archivo
-            // Si queda menos de 64KB, usamos potencias de 2 decrecientes
-            if (remainingInFile < BigInt(BASE_CHUNK)) {
-                if (remainingInFile <= 4096n) limit = 4096;
-                else if (remainingInFile <= 8192n) limit = 8192;
-                else if (remainingInFile <= 16384n) limit = 16384;
-                else if (remainingInFile <= 32768n) limit = 32768;
-                else limit = 65536; // 64KB fallback
+            const chunk = result.bytes;
+            const fetchedBytes = result.bytes.length;
+
+            // 3. PRE-CARGA: Pedir el SIGUIENTE bloque mientras procesamos este
+            const nextOffset = currentOffset + BigInt(fetchedBytes);
+            
+            if (fetchedBytes === CHUNK_SIZE && nextOffset <= end && !isAborted) {
+                nextChunkPromise = client.invoke(new Api.upload.GetFile({
+                    location: location,
+                    offset: nextOffset,
+                    limit: CHUNK_SIZE
+                })).catch(err => null);
+            } else {
+                nextChunkPromise = Promise.resolve(null);
             }
 
-            // Llamada a API
-            const result = await client.invoke(new Api.upload.GetFile({
-                location: location,
-                offset: currentOffset,
-                limit: limit
-            }));
-
-            if (!result || result.bytes.length === 0) break;
-
-            let chunk = result.bytes;
-
-            // Si es el primer chunk y tuvimos que alinear hacia atrás, cortamos lo sobrante
+            // 4. Enviar datos al usuario
+            let chunkToSend = chunk;
             if (initialSkip > 0) {
-                chunk = chunk.slice(initialSkip);
-                initialSkip = 0; // Solo se hace una vez
+                chunkToSend = chunk.slice(initialSkip);
+                initialSkip = 0;
             }
 
-            // Escribir al cliente
-            res.write(chunk);
-            
-            // Avanzar offset basado en lo que realmente descargamos de Telegram
-            // (IMPORTANTE: Usamos el tamaño sin cortar para el offset de Telegram)
-            currentOffset += BigInt(result.bytes.length);
+            if (!isAborted && !res.closed) {
+                res.write(chunkToSend);
+            }
 
-            if (res.writableEnded || res.closed) break;
-            
-            // Si Telegram devolvió menos de lo pedido, asumimos fin de archivo
-            if (result.bytes.length < limit) break;
+            currentOffset += BigInt(fetchedBytes);
+
+            if (fetchedBytes < CHUNK_SIZE) break;
         }
     } catch (err) {
-        console.error("⚠️ Stream Warning:", err.message);
-        // No lanzamos error fatal para que el navegador maneje el corte si es necesario
+        if (!isAborted) console.error("⚠️ Stream Error:", err.message);
     } finally {
-        if (!res.writableEnded) res.end();
+        if (!res.writableEnded && !res.closed) res.end();
     }
 }
 
-// --- AUXILIARES (Sin cambios) ---
+// --- AUXILIARES ---
 export async function uploadThumbnailBuffer(buffer) {
     await initClient();
     const res = await client.sendFile(botChatId, { file: buffer, forceDocument: false });
