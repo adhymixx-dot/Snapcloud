@@ -45,13 +45,11 @@ app.post("/login", async (req, res) => {
     } catch (e) { res.status(500).json({ error: "Error login" }); }
 });
 
-// --- UPLOAD (CON CORRECCIÓN DE SIZE) ---
+// --- UPLOAD ---
 app.post("/upload", authMiddleware, (req, res) => {
     const bb = busboy({ headers: req.headers });
     let vidP = null, thP = Promise.resolve(null);
     let fName = "", mime = "";
-    
-    // ESTO ES LO ÚNICO QUE AGREGUÉ A TU CÓDIGO ORIGINAL
     const fileSize = parseInt(req.headers['content-length'] || "0");
 
     bb.on('file', (name, file, info) => {
@@ -71,7 +69,6 @@ app.post("/upload", authMiddleware, (req, res) => {
             let tId = th ? (th.message_id || th) : null;
             if (typeof tId === 'object') tId = JSON.stringify(tId);
 
-            // AQUÍ TAMBIÉN AGREGUÉ EL SIZE
             await supabase.from('files').insert([{
                 user_id: req.user.id, name: fName, mime: mime, size: fileSize,
                 thumbnail_id: tId ? String(tId) : null,
@@ -93,7 +90,6 @@ app.get("/file-url/:file_id", authMiddleware, async (req, res) => {
     res.json({ url });
 });
 
-// --- STREAMING (Tu lógica original) ---
 app.get("/stream/:message_id", authMiddleware, async (req, res) => {
     try {
         const { data: f } = await supabase.from('files').select('mime, name, size').eq('message_id', req.params.message_id).single();

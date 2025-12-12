@@ -4,10 +4,9 @@ import { Buffer } from 'buffer';
 
 const apiId = Number(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
-// USAMOS TU BOT (Vital para que funcione en Render)
 const BOT_TOKEN = process.env.BOT_TOKEN; 
 
-// 1. Corrector de IDs (Vital para evitar CHANNEL_INVALID)
+// 1. Corrector de IDs
 function fixId(id) {
     if (!id) return BigInt(0);
     let s = String(id).trim();
@@ -19,7 +18,7 @@ function fixId(id) {
 const chatId = fixId(process.env.TELEGRAM_CHANNEL_ID); 
 const botChatId = process.env.BOT_CHANNEL_ID ? fixId(process.env.BOT_CHANNEL_ID) : chatId;
 
-// 2. Cliente Único (Estabilidad)
+// 2. Cliente Único
 const client = new TelegramClient(new StringSession(""), apiId, apiHash, { 
     connectionRetries: 5,
     useWSS: false 
@@ -31,15 +30,14 @@ async function initClient() {
         console.log("🔌 Conectando Bot...");
         clientPromise = (async () => {
             await client.start({ botAuthToken: BOT_TOKEN });
-            // Sincronización para evitar errores de acceso
-            try { await client.getDialogs({ limit: 5 }); } catch (e) {}
+            try { await client.getDialogs({ limit: 5 }); } catch (e) {} // Sincronizar
             console.log("✅ Bot listo.");
         })();
     }
     await clientPromise;
 }
 
-// --- SUBIDA (Tu lógica original) ---
+// --- SUBIDA (Tu código original) ---
 export async function uploadFromStream(stream, fileName, fileSize) {
     await initClient();
     const fileId = BigInt(Date.now());
@@ -86,7 +84,7 @@ export async function uploadFromStream(stream, fileName, fileSize) {
     };
 }
 
-// --- STREAMING (Tu lógica original) ---
+// --- STREAMING (Tu código original) ---
 export async function streamFile(messageId, res, range) {
     await initClient();
     
@@ -146,15 +144,14 @@ export async function streamFile(messageId, res, range) {
     await streamChunksToRes(location, res, start, end, fileSize);
 }
 
-// --- NÚCLEO CON REINTENTOS (La solución al error QUIC) ---
+// --- AQUÍ ESTÁ EL ARREGLO DEL ERROR QUIC ---
 async function streamChunksToRes(location, res, requestedStart, requestedEnd, totalFileSize) {
     let currentOffset = BigInt(requestedStart - (requestedStart % 4096));
     const end = BigInt(requestedEnd);
     const totalSize = BigInt(totalFileSize);
     let initialSkip = requestedStart % 4096;
 
-    // TU CONFIGURACIÓN PREFERIDA: 64KB
-    const BASE_CHUNK = 64 * 1024; 
+    const BASE_CHUNK = 64 * 1024; // Tu tamaño favorito
 
     try {
         while (currentOffset <= end) {
@@ -170,24 +167,13 @@ async function streamChunksToRes(location, res, requestedStart, requestedEnd, to
                 else limit = 65536; 
             }
 
-            // SISTEMA DE REINTENTOS (Esto arregla el corte)
-            let result = null;
-            let attempts = 0;
-            while(attempts < 3) {
-                try {
-                    result = await client.invoke(new Api.upload.GetFile({
-                        location: location,
-                        offset: currentOffset,
-                        limit: limit
-                    }));
-                    break; // Si funciona, salimos del bucle de intentos
-                } catch (e) {
-                    attempts++;
-                    await new Promise(r => setTimeout(r, 500 * attempts)); // Esperar un poco antes de reintentar
-                }
-            }
+            const result = await client.invoke(new Api.upload.GetFile({
+                location: location,
+                offset: currentOffset,
+                limit: limit
+            }));
 
-            if (!result || !result.bytes || result.bytes.length === 0) break;
+            if (!result || result.bytes.length === 0) break;
 
             let chunk = result.bytes;
             if (initialSkip > 0) {
@@ -195,16 +181,20 @@ async function streamChunksToRes(location, res, requestedStart, requestedEnd, to
                 initialSkip = 0; 
             }
 
-            // Si el cliente cerró la conexión, paramos
-            if (res.writableEnded || res.closed) break;
-
-            res.write(chunk);
+            // --- VÁLVULA DE CONTROL (Backpressure) ---
+            // Si el navegador dice "Estoy lleno" (false), esperamos a que diga "Ya puedes seguir" (drain).
+            const ok = res.write(chunk);
+            if (!ok) {
+                await new Promise(resolve => res.once('drain', resolve));
+            }
             
             currentOffset += BigInt(result.bytes.length);
+
+            if (res.writableEnded || res.closed) break;
             if (result.bytes.length < limit) break;
         }
     } catch (err) {
-        console.error("Stream Error:", err.message);
+        if(!err.message.includes("LIMIT_INVALID")) console.error("Stream Warning:", err.message);
     } finally {
         if (!res.writableEnded) res.end();
     }
